@@ -19,6 +19,9 @@ local.properties
 *.keystore
 /.continue
 .idea/misc.xml
+/.copilot-hub
+/.copilot-memory
+/.vscode
 fix_indent.py
 .copilot-memory/waveform-pipeline.md
 .vscode/tasks.json
