@@ -71,6 +71,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         private const val KEY_CUSTOM_RECORDING_PATH = "custom_recording_path"
         private const val KEY_CUSTOM_RECORDING_TREE_URI = "custom_recording_tree_uri"
         private const val KEY_PERSISTED_RECORDINGS_JSON = "persisted_recordings_json"
+
         // Global HP setting keys
         private const val KEY_GLOBAL_HP_ENABLED = "global_hp_enabled"
         private const val KEY_GLOBAL_HP_CUTOFF_HZ = "global_hp_cutoff_hz"
@@ -131,7 +132,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 arr.put(o)
             }
             settingsPrefs.edit().putString(KEY_PERSISTED_RECORDINGS_JSON, arr.toString()).apply()
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) {
+        }
     }
 
     private fun restorePersistedRecordings() {
@@ -148,18 +150,29 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 val duration = o.optDouble("duration", 0.0)
                 val fileURL = o.optString("fileURL", "")
                 val customName = if (o.has("customName")) o.optString("customName", null) else null
-                val deletedAt = if (o.has("deletedAt")) o.optLong("deletedAt", -1L).let { if (it < 0L) null else it } else null
+                val deletedAt =
+                    if (o.has("deletedAt")) o.optLong("deletedAt", -1L).let { if (it < 0L) null else it } else null
                 if (fileURL.isNotBlank()) {
                     // 自动清除已删除超过30天的录音
                     if (deletedAt != null && (now - deletedAt) > thirtyDaysMs) {
                         deleteRecordingFile(fileURL)
                         continue
                     }
-                    list.add(RecordedClip(id = id, date = date, duration = duration, fileURL = fileURL, customName = customName, deletedAt = deletedAt))
+                    list.add(
+                        RecordedClip(
+                            id = id,
+                            date = date,
+                            duration = duration,
+                            fileURL = fileURL,
+                            customName = customName,
+                            deletedAt = deletedAt
+                        )
+                    )
                 }
             }
             if (list.isNotEmpty()) _allRecordings.value = list
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) {
+        }
     }
 
     /** 删除录音文件（如果存在） */
@@ -172,7 +185,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 val f = File(fileURL)
                 if (f.exists()) f.delete()
             }
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) {
+        }
     }
 
     private val _publishRateOption = MutableStateFlow(PublishRateOption.HZ_20)
@@ -276,11 +290,16 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         var didWork = false
 
         while (true) {
-            val outIndex = try { codec.dequeueOutputBuffer(info, 0) } catch (_: Throwable) { return false }
+            val outIndex = try {
+                codec.dequeueOutputBuffer(info, 0)
+            } catch (_: Throwable) {
+                return false
+            }
             when {
                 outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     return didWork
                 }
+
                 outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     if (!recordingMuxerStarted) {
                         val newFormat = codec.outputFormat
@@ -290,6 +309,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     }
                     didWork = true
                 }
+
                 outIndex >= 0 -> {
                     val outBuf = codec.getOutputBuffer(outIndex)
                     if (outBuf != null && info.size > 0 && recordingMuxerStarted && recordingTrackIndex >= 0) {
@@ -306,6 +326,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         return false
                     }
                 }
+
                 else -> return didWork
             }
         }
@@ -318,7 +339,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
-    @Volatile private var _triggerEnabled = false
+    @Volatile
+    private var _triggerEnabled = false
     fun setTriggerEnabled(enabled: Boolean) {
         _triggerEnabled = enabled
     }
@@ -331,6 +353,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     /** 全部录音（含已删除），内部状态 */
     private val _allRecordings = MutableStateFlow(emptyList<RecordedClip>())
+
     /** 活跃录音列表（排除已删除的） */
     val recordings: StateFlow<List<RecordedClip>> = _allRecordings
         .map { list -> list.filter { it.deletedAt == null } }
@@ -339,6 +362,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             started = SharingStarted.Eagerly,
             initialValue = emptyList()
         )
+
     /** 最近删除的录音列表 */
     val recentlyDeletedRecordings: StateFlow<List<RecordedClip>> = _allRecordings
         .map { list ->
@@ -455,43 +479,53 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     // ====== 采集诊断状态（用于判断“有没有真实音频输入”） ======
     private val _audioInputAlive = MutableStateFlow(false)
+
     /** 最近一段时间是否检测到非零音频输入（maxAbs > 0） */
     val audioInputAlive: StateFlow<Boolean> = _audioInputAlive.asStateFlow()
 
     private val _lastReadSamples = MutableStateFlow(0)
+
     /** 最近一次 read() 读到的采样点数（short 数量） */
     val lastReadSamples: StateFlow<Int> = _lastReadSamples.asStateFlow()
 
     private val _lastMaxAbsPcm = MutableStateFlow(0)
+
     /** 最近一次 buffer 的最大绝对值（0 表示全静音/无输入） */
     val lastMaxAbsPcm: StateFlow<Int> = _lastMaxAbsPcm.asStateFlow()
 
     // ====== 更详细的诊断状态 ======
     private val _audioInitOk = MutableStateFlow(false)
+
     /** AudioRecord 是否初始化成功 */
     val audioInitOk: StateFlow<Boolean> = _audioInitOk.asStateFlow()
 
     private val _audioRecordingState = MutableStateFlow(AudioRecord.RECORDSTATE_STOPPED)
+
     /** AudioRecord.recordingState（STOPPED/RECORDING） */
     val audioRecordingState: StateFlow<Int> = _audioRecordingState.asStateFlow()
 
     private val _audioState = MutableStateFlow(AudioRecord.STATE_UNINITIALIZED)
+
     /** AudioRecord.state（INITIALIZED/UNINITIALIZED） */
     val audioState: StateFlow<Int> = _audioState.asStateFlow()
 
     private val _audioSourceUsed = MutableStateFlow(Int.MIN_VALUE)
+
     /** 实际使用的 AudioSource（例如 MIC/VOICE_RECOGNITION） */
     val audioSourceUsed: StateFlow<Int> = _audioSourceUsed.asStateFlow()
 
     private val _lastReadError = MutableStateFlow(0)
+
     /** 最近一次 read() 的错误码（0 表示无错误；负数一般表示 ERROR_*） */
     val lastReadError: StateFlow<Int> = _lastReadError.asStateFlow()
 
     private val _engineError = MutableStateFlow<String?>(null)
+
     /** 引擎错误信息（用于直接在界面提示用户） */
     val engineError: StateFlow<String?> = _engineError.asStateFlow()
 
     private val _filterGain = MutableStateFlow(1f)
+
     /** 手动滤波增益（autoGain 关闭时使用；或者作为 autoGain 的额外倍率） */
     val filterGain: StateFlow<Float> = _filterGain.asStateFlow()
 
@@ -515,9 +549,9 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     enum class TestSignalPreset(
         @StringRes
-            val labelResId: Int,
-            val carrierMultiple: Float = 0f,
-            val modulationAmp: Float = 0f,
+        val labelResId: Int,
+        val carrierMultiple: Float = 0f,
+        val modulationAmp: Float = 0f,
     ) {
         SPWM_1P(R.string.test_signal_spwm_1p, 3f, 2.5f),
         REC_5P(R.string.test_signal_5p),
@@ -570,10 +604,26 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     private val _eqBands = MutableStateFlow(
         listOf(
             // Keep original 4-band EQ layout (do not change defaults)
-            EqBand(id = 0, label = "1", type = EqBandType.LOW_SHELF, enabled = true, freqHz = 200f, gainDb = 0f, q = 0.3f),
+            EqBand(
+                id = 0,
+                label = "1",
+                type = EqBandType.LOW_SHELF,
+                enabled = true,
+                freqHz = 200f,
+                gainDb = 0f,
+                q = 0.3f
+            ),
             EqBand(id = 1, label = "2", type = EqBandType.PEAK, enabled = true, freqHz = 800f, gainDb = 0f, q = 0.5f),
             EqBand(id = 2, label = "3", type = EqBandType.PEAK, enabled = true, freqHz = 2000f, gainDb = 0f, q = 0.5f),
-            EqBand(id = 3, label = "4", type = EqBandType.HIGH_SHELF, enabled = true, freqHz = 5000f, gainDb = 0f, q = 0.3f),
+            EqBand(
+                id = 3,
+                label = "4",
+                type = EqBandType.HIGH_SHELF,
+                enabled = true,
+                freqHz = 5000f,
+                gainDb = 0f,
+                q = 0.3f
+            ),
         )
     )
     val eqBands: StateFlow<List<EqBand>> = _eqBands.asStateFlow()
@@ -695,12 +745,15 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     fun toggleLowPass(enabled: Boolean) {
         _lowPassEnabled.value = enabled
     }
+
     fun updateLowPassSlider(value: Float) {
         _lowPassCutoff.value = value
     }
+
     fun toggleHighPass(enabled: Boolean) {
         _highPassEnabled.value = enabled
     }
+
     fun updateHighPassSlider(value: Float) {
         _highPassCutoff.value = value
     }
@@ -718,7 +771,9 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         _ampScale.value = value
     }
 
-    fun updateFilterGain(value: Float) { _filterGain.value = value }
+    fun updateFilterGain(value: Float) {
+        _filterGain.value = value
+    }
 
     fun setTestSignalPreset(preset: TestSignalPreset) {
         _testSignalPreset.value = preset
@@ -734,7 +789,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             recordingStopJob?.cancel()
             recordingStopJob = viewModelScope.launch(Dispatchers.Default) { stopRecordingInternalBlocking() }
             monitorTrack?.let {
-                try { it.release() } catch (_: Throwable) {}
+                try {
+                    it.release()
+                } catch (_: Throwable) {
+                }
             }
             monitorTrack = null
             stopImportedSignalInput()
@@ -755,13 +813,15 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         val ctx = context
         importJob = viewModelScope.launch(Dispatchers.Default) {
             try {
-                val decoded = decodeAudioToMonoTempPcm(context, uri,
+                val decoded = decodeAudioToMonoTempPcm(
+                    context, uri,
                     onProgress = { progress -> _importProgress.value = progress },
                     shouldCancel = { !isActive }
                 )
                 _importProgress.value = 1f
                 if (!decoded.pcmFile.exists() || decoded.pcmFile.length() < 2L) {
-                    val failMsg = ctx.getString(R.string.import_audio_failed_prefix) + ctx.getString(R.string.preset_import_failed_empty)
+                    val failMsg =
+                        ctx.getString(R.string.import_audio_failed_prefix) + ctx.getString(R.string.preset_import_failed_empty)
                     _engineError.value = failMsg
                     _importResultMessage.value = failMsg
                     clearImportedSignalData(decoded)
@@ -782,8 +842,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 _importedSignalPaused.value = false
                 _importedPlaybackPositionMs.value = 0L
                 _importedPlaybackDurationMs.value = (
-                    (decoded.pcmFile.length().coerceAtLeast(0L) / 2L) * 1000L / decoded.sampleRate.coerceAtLeast(1)
-                ).coerceAtLeast(1L)
+                        (decoded.pcmFile.length().coerceAtLeast(0L) / 2L) * 1000L / decoded.sampleRate.coerceAtLeast(1)
+                        ).coerceAtLeast(1L)
                 _useImportedSignal.value = true
                 _isRunning.value = true
                 startImportedSignalJob()
@@ -795,7 +855,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     _engineError.value = null
                     _importResultMessage.value = ctx.getString(R.string.import_audio_cancelled)
                 } else {
-                    val failMsg = ctx.getString(R.string.import_audio_failed_prefix) + (t.message ?: t.javaClass.simpleName)
+                    val failMsg =
+                        ctx.getString(R.string.import_audio_failed_prefix) + (t.message ?: t.javaClass.simpleName)
                     _engineError.value = failMsg
                     _importResultMessage.value = failMsg
                 }
@@ -823,9 +884,18 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         stopImportedSignalJob()
         if (_isRecording.value) stopRecording()
         monitorTrack?.let {
-            try { it.pause() } catch (_: Throwable) {}
-            try { it.flush() } catch (_: Throwable) {}
-            try { it.release() } catch (_: Throwable) {}
+            try {
+                it.pause()
+            } catch (_: Throwable) {
+            }
+            try {
+                it.flush()
+            } catch (_: Throwable) {
+            }
+            try {
+                it.release()
+            } catch (_: Throwable) {
+            }
         }
         monitorTrack = null
         _isRunning.value = false
@@ -965,7 +1035,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             // 用 ring buffer，避免每帧都做 List 拼接
             captureJob = viewModelScope.launch(Dispatchers.Default) {
                 // 尽量把采集线程提到更高优先级（防止被系统调度导致周期性 underrun）
-                try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) } catch (_: Throwable) {}
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+                } catch (_: Throwable) {
+                }
 
                 val shortBuf = ShortArray(captureBufferBytes / 2)
                 val readBlockSamples = (sampleRate / 50).coerceAtLeast(64).coerceAtMost(shortBuf.size)
@@ -974,9 +1047,18 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 fun ensureMonitorStarted(): AudioTrack? {
                     if (!_isMonitoring.value) {
                         monitorTrack?.let {
-                            try { it.pause() } catch (_: Throwable) {}
-                            try { it.flush() } catch (_: Throwable) {}
-                            try { it.release() } catch (_: Throwable) {}
+                            try {
+                                it.pause()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                it.flush()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                it.release()
+                            } catch (_: Throwable) {
+                            }
                         }
                         monitorTrack = null
                         return null
@@ -1009,7 +1091,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         AudioTrack.MODE_STREAM,
                         AudioManager.AUDIO_SESSION_ID_GENERATE
                     )
-                    try { track.play() } catch (_: Throwable) {}
+                    try {
+                        track.play()
+                    } catch (_: Throwable) {
+                    }
                     monitorTrack = track
                     return track
                 }
@@ -1091,7 +1176,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                             consecutiveZeroReads++
                             // 某些环境会卡在 0：连续 1s 都是 0，就认为采集卡死
                             if (consecutiveZeroReads >= 10) {
-                                _engineError.value = "AudioRecord.read() 连续返回 0：可能是模拟器无麦克风输入或麦克风被占用"
+                                _engineError.value =
+                                    "AudioRecord.read() 连续返回 0：可能是模拟器无麦克风输入或麦克风被占用"
                                 Log.e("WaveStudio", "AudioRecord.read() stuck at 0; stopping engine")
                                 _isRunning.value = false
                                 break
@@ -1113,7 +1199,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     consecutiveZeroReads = 0
 
                     // ===== 监听/录音共享：把当前 block 做滤波（用于监听输出 + 写入录音） =====
-                    val needFilteredBlock = _isMonitoring.value || (_isRecording.value && (recordingCodec != null || wavOut != null))
+                    val needFilteredBlock =
+                        _isMonitoring.value || (_isRecording.value && (recordingCodec != null || wavOut != null))
                     if (needFilteredBlock) {
                         try {
                             // short -> float（复用 buffer）
@@ -1173,7 +1260,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 }
                             }
                         } catch (_: Throwable) {
-                            try { track.release() } catch (_: Throwable) {}
+                            try {
+                                track.release()
+                            } catch (_: Throwable) {
+                            }
                             monitorTrack = null
                         }
                     }
@@ -1209,7 +1299,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
                     // ===== UI 波形更新限流：避免每个 audio block 都触发 Compose 重组造成卡顿 =====
                     val nowUi = SystemClock.elapsedRealtime()
-                    val busyRealtimePath = _isMonitoring.value || (_isRecording.value && (recordingCodec != null || wavOut != null))
+                    val busyRealtimePath =
+                        _isMonitoring.value || (_isRecording.value && (recordingCodec != null || wavOut != null))
 
                     val actualPublishIntervalMs = currentPublishIntervalMs()
 
@@ -1219,18 +1310,17 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         val windowSamples = max(64, (sampleRate * (_windowMs.value / 1000f)).toInt())
                             .coerceAtMost(ring.size)
 
-                        // Always fetch exactly windowSamples for the trigger engine.
-                        // This gives the engine a consistent frame-to-frame view of the
-                        // signal so its internal lastAnchor always refers to the same
-                        // physical position in the following frame's buffer.
-                        val fetchStart = (ringWrite - windowSamples + ring.size) % ring.size
+                        // fetchStart from ringWrite - fillCount so ALL fillCount samples
+                        // are fresh (no stale ring-wrap data causing discontinuity).
+                        val fillCount = min(windowSamples * 2, ring.size)
+                        val fetchStart = (ringWrite - fillCount + ring.size) % ring.size
 
-                        for (i in 0 until windowSamples) {
+                        for (i in 0 until fillCount) {
                             uiSlice[i] = ring[(fetchStart + i) % ring.size]
                         }
 
                         if (needFilteredBlock && filteredOutShort != null) {
-                            for (i in 0 until windowSamples) {
+                            for (i in 0 until fillCount) {
                                 uiFiltered[i] = ringFiltered[(fetchStart + i) % ring.size]
                             }
                         } else {
@@ -1248,14 +1338,15 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 globalHighPassEnabled = _globalHighPassEnabled.value,
                                 globalHighPassCutoffHz = _globalHighPassCutoff.value,
                             )
-                            uiWaveformFilter.process(uiSlice, uiFiltered, windowSamples)
+                            uiWaveformFilter.process(uiSlice, uiFiltered, fillCount)
                         }
 
                         // UI display: raw and filtered waveforms at full window resolution
                         val targetPoints = 512
                         val publishedSpanMs = _windowMs.value
                         val downRaw = downsamplePeakFloatArray(uiSlice, 0, windowSamples, targetPoints = targetPoints)
-                        val downFiltered = downsamplePeakFloatArray(uiFiltered, 0, windowSamples, targetPoints = targetPoints)
+                        val downFiltered =
+                            downsamplePeakFloatArray(uiFiltered, 0, windowSamples, targetPoints = targetPoints)
                         val immersiveFiltered = resampleLinearFloatArray(uiFiltered, 0, windowSamples, targetPoints)
 
                         _rawWaveform.value = downRaw
@@ -1283,32 +1374,33 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                     mode = if (triggerArmedNow) SimpleTriggerEngine.Mode.RISING else SimpleTriggerEngine.Mode.OFF,
                                     sampleRateHz = sampleRate.toFloat(),
                                     preTriggerRatio = 0.30f,
+                                    globalBase = fetchStart.toLong(),
                                 )
 
-                                val trigSrc = uiFiltered.copyOfRange(0, windowSamples)
-                                val anchorOffset = ((triggerRingBase - fetchStart + ring.size) % ring.size)
-                                    .coerceAtMost(windowSamples - 1)
-                                triggerEngine.seekAnchorTo(anchorOffset)
-
-                                val res = try { triggerEngine.process(trigSrc, trigCfg) } catch (_: Throwable) { null }
+                                val trigSrc = uiFiltered.copyOfRange(0, fillCount)
+                                // Engine maintains global state internally via lastTriggerGlobalIdx.
+                                // No seekAnchorTo() — it would corrupt global state with clamped local offset.
+                                val res = try {
+                                    triggerEngine.process(trigSrc, trigCfg)
+                                } catch (_: Throwable) {
+                                    null
+                                }
                                 val now = SystemClock.elapsedRealtime()
                                 if (res != null && res.mode != SimpleTriggerEngine.Mode.OFF) {
                                     _triggerResult.value = res
                                     if (res.locked && res.periodSamples > 0) {
                                         lastGoodTriggerMs = now
                                         triggerRingBase = (fetchStart + res.anchorIndex) % ring.size
-                                        // Extract windowSamples-wide window from ringFiltered
-                                        // (contiguous ring data). This avoids the discontinuity
-                                        // from wrapping within trigSrc (only windowSamples copy).
-                                        val preCount = (windowSamples * trigCfg.preTriggerRatio).toInt().coerceIn(0, windowSamples - 1)
-                                        val trigRingStart = ((triggerRingBase - preCount + ring.size) % ring.size)
+                                        // Extract window from uiFiltered (contiguous, no ring-wrap issues).
+                                        val preCount = (windowSamples * trigCfg.preTriggerRatio).toInt()
+                                            .coerceIn(0, windowSamples - 1)
                                         val trigWin = FloatArray(windowSamples)
-                                        val firstPart = minOf(windowSamples, ring.size - trigRingStart)
-                                        ringFiltered.copyInto(trigWin, 0, trigRingStart, trigRingStart + firstPart)
-                                        if (firstPart < windowSamples) {
-                                            ringFiltered.copyInto(trigWin, firstPart, 0, windowSamples - firstPart)
+                                        val trigRingStart = ((triggerRingBase - preCount + ring.size) % ring.size)
+                                        for (i in 0 until windowSamples) {
+                                            trigWin[i] = ringFiltered[(trigRingStart + i) % ring.size]
                                         }
-                                        _triggeredWindow.value = downsamplePeakFloatArray(trigWin, 0, windowSamples, targetPoints)
+                                        _triggeredWindow.value =
+                                            downsamplePeakFloatArray(trigWin, 0, windowSamples, targetPoints)
                                     }
                                 }
                             }
@@ -1324,8 +1416,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private var testJob: Job? = null
-        private var cachedTestAudioSamples: FloatArray? = null
-        private var wavTestSignalSampleRate: Int = 0
+    private var cachedTestAudioSamples: FloatArray? = null
+    private var wavTestSignalSampleRate: Int = 0
     private var importedSignalJob: Job? = null
     private var importJob: Job? = null
     private var importedSignalData: ImportedAudioData? = null
@@ -1388,7 +1480,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             } else {
                 // WAVE_FORMAT_PCM: assume 16-bit mono
                 val sampleCount = dataSize / 2
-                    samples = FloatArray(sampleCount)
+                samples = FloatArray(sampleCount)
                 for (i in 0 until sampleCount) {
                     val lo = rawBytes[offset + i * 2].toInt() and 0xFF
                     val hi = rawBytes[offset + i * 2 + 1].toInt() and 0xFF
@@ -1398,8 +1490,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             }
             cachedTestAudioSamples = samples
             return samples
-        }
-        catch (e: Exception) {
+        } catch (e: Exception) {
             Log.e("Oscope", "loadWavTestSignal failed", e)
             return null
         }
@@ -1409,105 +1500,116 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         if (testJob != null) return
         resetWaveformPublishStats()
         testJob = viewModelScope.launch(Dispatchers.Default) {
-                var cachedWavResampled: FloatArray? = null
-                var lastWavPreset: TestSignalPreset? = null
-                var wasWav = false
-                var cycleOffset = 0L
+            var cachedWavResampled: FloatArray? = null
+            var lastWavPreset: TestSignalPreset? = null
+            var wasWav = false
+            var cycleOffset = 0L
 
-                while (isActive && _useTestSignal.value) {
-                    val window = _windowMs.value
-                    val displayTargetPoints = 512
-                    val immersiveTargetPoints = 512 * 3
-                    val publishedSpanMs = window * 3f
+            while (isActive && _useTestSignal.value) {
+                val window = _windowMs.value
+                val displayTargetPoints = 512
+                val immersiveTargetPoints = 512 * 3
+                val publishedSpanMs = window * 3f
 
-                    val samplesNeeded = ((sampleRate * publishedSpanMs) / 1000f).roundToInt().coerceAtLeast(1)
-                    val isWav = _testSignalPreset.value == TestSignalPreset.REC_5P || _testSignalPreset.value == TestSignalPreset.W7
+                val samplesNeeded = ((sampleRate * publishedSpanMs) / 1000f).roundToInt().coerceAtLeast(1)
+                val isWav =
+                    _testSignalPreset.value == TestSignalPreset.REC_5P || _testSignalPreset.value == TestSignalPreset.W7
 
-                    // Invalidate WAV caches when switching between different WAV presets (e.g. REC_5P ↔ W7)
-                    if (isWav && _testSignalPreset.value != lastWavPreset) {
-                        cachedTestAudioSamples = null
-                        cachedWavResampled = null
-                        lastWavPreset = _testSignalPreset.value
-                    }
-
-                    // (Re)load resampled WAV cache only when entering WAV mode
-                    if (isWav && cachedWavResampled == null) {
-                        val wavSamples = loadWavTestSignal()
-                        val wavSampleRate = if (wavSamples != null) wavTestSignalSampleRate else sampleRate
-                        cachedWavResampled = if (wavSamples != null && wavSampleRate != sampleRate) {
-                            resampleLinearFloatArray(wavSamples, 0, wavSamples.size, (wavSamples.size.toLong() * sampleRate / wavSampleRate).toInt())
-                        } else {
-                            wavSamples
-                        }
-                    }
-                    if (!isWav) {
-                        cachedWavResampled = null
-                        lastWavPreset = null
-                    }
-
-                    // Reset cycle position when switching modes (SPWM↔WAV)
-                    if (isWav != wasWav) {
-                        cycleOffset = 0
-                        wasWav = isWav
-                    }
-
-                    val samples: FloatArray
-                    if (isWav && cachedWavResampled != null && cachedWavResampled!!.isNotEmpty()) {
-                        val cache = cachedWavResampled!!
-                            // Static display: always show from the beginning, never scroll
-                            samples = FloatArray(samplesNeeded) { i ->
-                                if (i < cache.size) cache[i] else 0f
-                            }
-                            cycleOffset = 0
-                    } else {
-                        val preset = _testSignalPreset.value
-                        samples = VvvfTestSignal.generateLineUv(
-                            sampleRate = sampleRate,
-                            windowMs = publishedSpanMs,
-                            baseHz = 50f,
-                            modulationAmp = preset.modulationAmp,
-                            carrierMultiple = preset.carrierMultiple,
-                        )
-                    }
-
-                    val rawList = samples.toList()
-                    val visibleWindowSamples = ((sampleRate * window) / 1000f).roundToInt().coerceIn(1, samplesNeeded)
-                    val visibleStart = (samplesNeeded - visibleWindowSamples).coerceAtLeast(0)
-                    val downRaw = downsamplePeakFloatArray(samples, visibleStart, samples.size, targetPoints = displayTargetPoints)
-
-                    val filteredAll = applyFiltersBiquad(
-                        input = rawList,
-                        sampleRate = sampleRate,
-                        lowPassEnabled = lowPassEnabled.value,
-                        lowPassCutoffHz = lowPassCutoff.value,
-                        highPassEnabled = highPassEnabled.value,
-                        highPassCutoffHz = highPassCutoff.value
-                    )
-                    val downFiltered = downsamplePeak(filteredAll.subList(visibleStart, filteredAll.size), targetPoints = displayTargetPoints).toFloatArray()
-                    val immersiveFiltered = resampleLinearFloatArray(filteredAll.toFloatArray(), 0, filteredAll.size, immersiveTargetPoints)
-
-                    _rawWaveform.value = downRaw
-                    _filteredWaveform.value = downFiltered
-                    _immersiveFilteredWaveform.value = immersiveFiltered
-                    _publishedWaveformSpanMs.value = publishedSpanMs
-                    markWaveformPublished()
-
-                    _audioInputAlive.value = true
-                    _lastReadSamples.value = samplesNeeded
-                    _lastMaxAbsPcm.value = if (isWav && cachedWavResampled != null) {
-                        var maxAbs = 0
-                        for (i in samples.indices) {
-                            val pcm = (samples[i] * 32767f).toInt().coerceIn(-32768, 32767)
-                            val a = kotlin.math.abs(pcm)
-                            if (a > maxAbs) maxAbs = a
-                        }
-                        maxAbs
-                    } else {
-                        32767
-                    }
-
-                    kotlinx.coroutines.delay(currentPublishIntervalMs())
+                // Invalidate WAV caches when switching between different WAV presets (e.g. REC_5P ↔ W7)
+                if (isWav && _testSignalPreset.value != lastWavPreset) {
+                    cachedTestAudioSamples = null
+                    cachedWavResampled = null
+                    lastWavPreset = _testSignalPreset.value
                 }
+
+                // (Re)load resampled WAV cache only when entering WAV mode
+                if (isWav && cachedWavResampled == null) {
+                    val wavSamples = loadWavTestSignal()
+                    val wavSampleRate = if (wavSamples != null) wavTestSignalSampleRate else sampleRate
+                    cachedWavResampled = if (wavSamples != null && wavSampleRate != sampleRate) {
+                        resampleLinearFloatArray(
+                            wavSamples,
+                            0,
+                            wavSamples.size,
+                            (wavSamples.size.toLong() * sampleRate / wavSampleRate).toInt()
+                        )
+                    } else {
+                        wavSamples
+                    }
+                }
+                if (!isWav) {
+                    cachedWavResampled = null
+                    lastWavPreset = null
+                }
+
+                // Reset cycle position when switching modes (SPWM↔WAV)
+                if (isWav != wasWav) {
+                    cycleOffset = 0
+                    wasWav = isWav
+                }
+
+                val samples: FloatArray
+                if (isWav && cachedWavResampled != null && cachedWavResampled!!.isNotEmpty()) {
+                    val cache = cachedWavResampled!!
+                    // Static display: always show from the beginning, never scroll
+                    samples = FloatArray(samplesNeeded) { i ->
+                        if (i < cache.size) cache[i] else 0f
+                    }
+                    cycleOffset = 0
+                } else {
+                    val preset = _testSignalPreset.value
+                    samples = VvvfTestSignal.generateLineUv(
+                        sampleRate = sampleRate,
+                        windowMs = publishedSpanMs,
+                        baseHz = 50f,
+                        modulationAmp = preset.modulationAmp,
+                        carrierMultiple = preset.carrierMultiple,
+                    )
+                }
+
+                val rawList = samples.toList()
+                val visibleWindowSamples = ((sampleRate * window) / 1000f).roundToInt().coerceIn(1, samplesNeeded)
+                val visibleStart = (samplesNeeded - visibleWindowSamples).coerceAtLeast(0)
+                val downRaw =
+                    downsamplePeakFloatArray(samples, visibleStart, samples.size, targetPoints = displayTargetPoints)
+
+                val filteredAll = applyFiltersBiquad(
+                    input = rawList,
+                    sampleRate = sampleRate,
+                    lowPassEnabled = lowPassEnabled.value,
+                    lowPassCutoffHz = lowPassCutoff.value,
+                    highPassEnabled = highPassEnabled.value,
+                    highPassCutoffHz = highPassCutoff.value
+                )
+                val downFiltered = downsamplePeak(
+                    filteredAll.subList(visibleStart, filteredAll.size),
+                    targetPoints = displayTargetPoints
+                ).toFloatArray()
+                val immersiveFiltered =
+                    resampleLinearFloatArray(filteredAll.toFloatArray(), 0, filteredAll.size, immersiveTargetPoints)
+
+                _rawWaveform.value = downRaw
+                _filteredWaveform.value = downFiltered
+                _immersiveFilteredWaveform.value = immersiveFiltered
+                _publishedWaveformSpanMs.value = publishedSpanMs
+                markWaveformPublished()
+
+                _audioInputAlive.value = true
+                _lastReadSamples.value = samplesNeeded
+                _lastMaxAbsPcm.value = if (isWav && cachedWavResampled != null) {
+                    var maxAbs = 0
+                    for (i in samples.indices) {
+                        val pcm = (samples[i] * 32767f).toInt().coerceIn(-32768, 32767)
+                        val a = kotlin.math.abs(pcm)
+                        if (a > maxAbs) maxAbs = a
+                    }
+                    maxAbs
+                } else {
+                    32767
+                }
+
+                kotlinx.coroutines.delay(currentPublishIntervalMs())
+            }
         }
     }
 
@@ -1564,9 +1666,18 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 fun ensureMonitorStarted(): AudioTrack? {
                     if (!_isMonitoring.value) {
                         monitorTrack?.let {
-                            try { it.pause() } catch (_: Throwable) {}
-                            try { it.flush() } catch (_: Throwable) {}
-                            try { it.release() } catch (_: Throwable) {}
+                            try {
+                                it.pause()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                it.flush()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                it.release()
+                            } catch (_: Throwable) {
+                            }
                         }
                         monitorTrack = null
                         return null
@@ -1599,7 +1710,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         AudioTrack.MODE_STREAM,
                         AudioManager.AUDIO_SESSION_ID_GENERATE
                     )
-                    try { track.play() } catch (_: Throwable) {}
+                    try {
+                        track.play()
+                    } catch (_: Throwable) {
+                    }
                     monitorTrack = track
                     return track
                 }
@@ -1685,7 +1799,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     _lastReadSamples.value = chunkSize
                     _lastMaxAbsPcm.value = maxAbs
 
-                    val needFilteredBlock = _isMonitoring.value || (_isRecording.value && (recordingCodec != null || wavOut != null))
+                    val needFilteredBlock =
+                        _isMonitoring.value || (_isRecording.value && (recordingCodec != null || wavOut != null))
                     if (needFilteredBlock) {
                         for (i in 0 until chunkSize) {
                             inBlock[i] = chunk[i].coerceIn(-1f, 1f)
@@ -1739,7 +1854,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                             val pcm = out ?: monitorSilence
                             var offset = 0
                             while (offset < chunkSize) {
-                                val written = track.write(pcm, offset, chunkSize - offset, AudioTrack.WRITE_NON_BLOCKING)
+                                val written =
+                                    track.write(pcm, offset, chunkSize - offset, AudioTrack.WRITE_NON_BLOCKING)
                                 if (written > 0) {
                                     offset += written
                                 } else if (written == 0) {
@@ -1749,7 +1865,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 }
                             }
                         } catch (_: Throwable) {
-                            try { track.release() } catch (_: Throwable) {}
+                            try {
+                                track.release()
+                            } catch (_: Throwable) {
+                            }
                             monitorTrack = null
                         }
                     }
@@ -1767,13 +1886,14 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         val minTriggerSamples = if (triggerArmed) 640 else 0
                         val fetchSamples = min(ringSize, max(windowSamples + extraSamples, minTriggerSamples))
                         if (fetchSamples > 0) {
-                            val fetchStart = (ringWrite - fetchSamples + ring.size) % ring.size
-                            for (i in 0 until fetchSamples) {
+                            val fillCount = min(fetchSamples * 2, ring.size)
+                            val fetchStart = (ringWrite - fillCount + ring.size) % ring.size
+                            for (i in 0 until fillCount) {
                                 uiSlice[i] = ring[(fetchStart + i) % ring.size]
                             }
 
                             if (needFilteredBlock) {
-                                for (i in 0 until fetchSamples) {
+                                for (i in 0 until fillCount) {
                                     uiFiltered[i] = ringFiltered[(fetchStart + i) % ring.size]
                                 }
                             } else {
@@ -1791,7 +1911,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                     globalHighPassEnabled = globalHighPassEnabled.value,
                                     globalHighPassCutoffHz = globalHighPassCutoff.value,
                                 )
-                                uiWaveformFilter.process(uiSlice, uiFiltered, fetchSamples)
+                                uiWaveformFilter.process(uiSlice, uiFiltered, fillCount)
                             }
 
                             val targetPoints = when {
@@ -1799,8 +1919,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 monitorOn -> 384
                                 else -> 704
                             }
-                            val downRaw = downsamplePeakFloatArray(uiSlice, 0, fetchSamples, targetPoints = targetPoints)
-                            val downFiltered = downsamplePeakFloatArray(uiFiltered, 0, fetchSamples, targetPoints = targetPoints)
+                            val downRaw =
+                                downsamplePeakFloatArray(uiSlice, 0, fetchSamples, targetPoints = targetPoints)
+                            val downFiltered =
+                                downsamplePeakFloatArray(uiFiltered, 0, fetchSamples, targetPoints = targetPoints)
                             val immersiveFiltered = resampleLinearFloatArray(uiFiltered, 0, fetchSamples, targetPoints)
                             val publishedSpanMs = _windowMs.value * (fetchSamples.toFloat() / windowSamples.toFloat())
 
@@ -1818,31 +1940,32 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                     mode = if (triggerArmedNow2) SimpleTriggerEngine.Mode.RISING else SimpleTriggerEngine.Mode.OFF,
                                     sampleRateHz = sampleRate.toFloat(),
                                     preTriggerRatio = 0.30f,
+                                    globalBase = fetchStart.toLong(),
                                 )
                                 val trigSrc2 = uiFiltered.copyOfRange(0, fetchSamples)
-                                if (triggerRingAnchorBase >= 0 && trigSrc2.isNotEmpty()) {
-                                    val localAnchor = ((triggerRingAnchorBase - fetchStart + ring.size) % ring.size)
-                                        .coerceAtMost(trigSrc2.lastIndex.coerceAtLeast(0))
-                                    triggerEngine.seekAnchorTo(localAnchor)
+                                // Engine maintains global state internally — no seekAnchorTo needed.
+                                val res2 = try {
+                                    triggerEngine.process(trigSrc2, trigCfg2)
+                                } catch (_: Throwable) {
+                                    null
                                 }
-                                val res2 = try { triggerEngine.process(trigSrc2, trigCfg2) } catch (_: Throwable) { null }
                                 val now2 = SystemClock.elapsedRealtime()
                                 if (res2 != null && res2.mode != SimpleTriggerEngine.Mode.OFF) {
                                     _triggerResult.value = res2
                                     if (res2.locked && res2.periodSamples > 0) {
                                         lastGoodTriggerMs = now2
                                         triggerRingAnchorBase = (fetchStart + res2.anchorIndex) % ring.size
-                                        // Extract a fetchSamples-wide window from ring buffer to match
-                                        // the non-triggered display's time span (which also uses fetchSamples).
-                                        val fetchPreCount = (fetchSamples * trigCfg2.preTriggerRatio).toInt().coerceIn(0, fetchSamples - 1)
-                                        val fetchRingStart = ((triggerRingAnchorBase - fetchPreCount + ring.size) % ring.size)
+                                        // Extract from ringFiltered (contiguous ring data, no stale reads)
+                                        val fetchPreCount = (fetchSamples * trigCfg2.preTriggerRatio).toInt()
+                                            .coerceIn(0, fetchSamples - 1)
                                         val trigWin = FloatArray(fetchSamples)
-                                        val firstPart = minOf(fetchSamples, ring.size - fetchRingStart)
-                                        ringFiltered.copyInto(trigWin, 0, fetchRingStart, fetchRingStart + firstPart)
-                                        if (firstPart < fetchSamples) {
-                                            ringFiltered.copyInto(trigWin, firstPart, 0, fetchSamples - firstPart)
+                                        val trigRingStart2 =
+                                            ((triggerRingAnchorBase - fetchPreCount + ring.size) % ring.size)
+                                        for (i in 0 until fetchSamples) {
+                                            trigWin[i] = ringFiltered[(trigRingStart2 + i) % ring.size]
                                         }
-                                        _triggeredWindow.value = downsamplePeakFloatArray(trigWin, 0, fetchSamples, targetPoints)
+                                        _triggeredWindow.value =
+                                            downsamplePeakFloatArray(trigWin, 0, fetchSamples, targetPoints)
                                     }
                                 }
                             }
@@ -1892,7 +2015,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             }
         }
         if (trackIndex < 0 || format == null) {
-            try { afd.close() } catch (_: Throwable) {}
+            try {
+                afd.close()
+            } catch (_: Throwable) {
+            }
             extractor.release()
             throw IllegalStateException("未找到可解码音轨")
         }
@@ -1960,6 +2086,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 AudioFormat.ENCODING_PCM_16BIT
                             }
                         }
+
                         MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                         else -> if (outIndex >= 0) {
                             val outBuf = codec.getOutputBuffer(outIndex)
@@ -1995,12 +2122,24 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 success = true
             }
         } finally {
-            try { codec.stop() } catch (_: Throwable) {}
-            try { codec.release() } catch (_: Throwable) {}
+            try {
+                codec.stop()
+            } catch (_: Throwable) {
+            }
+            try {
+                codec.release()
+            } catch (_: Throwable) {
+            }
             extractor.release()
-            try { afd.close() } catch (_: Throwable) {}
+            try {
+                afd.close()
+            } catch (_: Throwable) {
+            }
             if (!success) {
-                try { outFile.delete() } catch (_: Throwable) {}
+                try {
+                    outFile.delete()
+                } catch (_: Throwable) {
+                }
             }
         }
 
@@ -2028,16 +2167,28 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         _isRecording.value = false
 
         // reset realtime filter states so next start doesn't pop
-        try { monitorRecordFilter.resetState() } catch (_: Throwable) {}
+        try {
+            monitorRecordFilter.resetState()
+        } catch (_: Throwable) {
+        }
 
         captureJob?.cancel()
         captureJob = null
 
         // stop monitor
         monitorTrack?.let {
-            try { it.pause() } catch (_: Throwable) {}
-            try { it.flush() } catch (_: Throwable) {}
-            try { it.release() } catch (_: Throwable) {}
+            try {
+                it.pause()
+            } catch (_: Throwable) {
+            }
+            try {
+                it.flush()
+            } catch (_: Throwable) {
+            }
+            try {
+                it.release()
+            } catch (_: Throwable) {
+            }
         }
         monitorTrack = null
 
@@ -2051,7 +2202,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         stopPlayback()
 
         audioRecord?.let {
-            try { it.stop() } catch (_: Throwable) {}
+            try {
+                it.stop()
+            } catch (_: Throwable) {
+            }
             it.release()
         }
         audioRecord = null
@@ -2077,10 +2231,16 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             stopRecordingInternalBlocking()
         }
         monitorTrack?.let {
-            try { it.release() } catch (_: Throwable) {}
+            try {
+                it.release()
+            } catch (_: Throwable) {
+            }
         }
         monitorTrack = null
-        try { monitorRecordFilter.resetState() } catch (_: Throwable) {}
+        try {
+            monitorRecordFilter.resetState()
+        } catch (_: Throwable) {
+        }
         stopVvvfTestJob()
         stopImportedSignalInput()
         stopEngine()
@@ -2264,7 +2424,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         val customPath = settingsPrefs.getString(KEY_CUSTOM_RECORDING_PATH, null)
         if (!customPath.isNullOrBlank()) {
             val normalized = customPath.trim()
-            val candidate = try { File(normalized) } catch (_: Throwable) { null }
+            val candidate = try {
+                File(normalized)
+            } catch (_: Throwable) {
+                null
+            }
             if (candidate != null) {
                 if (candidate.isAbsolute) {
                     val dir = if (
@@ -2334,11 +2498,15 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     treeUri,
                     android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 )
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+            }
 
             val createdUri = try {
-                DocumentFile.fromTreeUri(app, treeUri)?.createFile(recordingMimeType(sourceFile.name), sourceFile.name)?.uri
-            } catch (_: Throwable) { null }
+                DocumentFile.fromTreeUri(app, treeUri)
+                    ?.createFile(recordingMimeType(sourceFile.name), sourceFile.name)?.uri
+            } catch (_: Throwable) {
+                null
+            }
                 ?: try {
                     android.provider.DocumentsContract.createDocument(
                         app.contentResolver,
@@ -2346,7 +2514,9 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         recordingMimeType(sourceFile.name),
                         sourceFile.name,
                     )
-                } catch (_: Throwable) { null }
+                } catch (_: Throwable) {
+                    null
+                }
                 ?: return null
 
             var copied = false
@@ -2358,7 +2528,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             }
 
             if (copied) {
-                val sourceSize = try { sourceFile.length() } catch (_: Throwable) { -1L }
+                val sourceSize = try {
+                    sourceFile.length()
+                } catch (_: Throwable) {
+                    -1L
+                }
                 val copiedOk = if (sourceSize > 0L) {
                     try {
                         app.contentResolver.openFileDescriptor(createdUri, "r")?.use { fd ->
@@ -2374,16 +2548,21 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 if (!copiedOk) {
                     try {
                         app.contentResolver.delete(createdUri, null, null)
-                    } catch (_: Throwable) {}
+                    } catch (_: Throwable) {
+                    }
                     return null
                 }
 
                 val newUriStr = createdUri.toString()
                 _allRecordings.update { list -> list.map { if (it.fileURL == sourceFile.absolutePath) it.copy(fileURL = newUriStr) else it } }
-                try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+                try {
+                    persistRecordingsToPrefs()
+                } catch (_: Throwable) {
+                }
                 return newUriStr
             }
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) {
+        }
         return null
     }
 
@@ -2408,19 +2587,34 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     sourceFile.inputStream().use { input -> input.copyTo(out) }
                 } ?: return null
                 try {
-                    app.contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-                } catch (_: Throwable) {}
+                    app.contentResolver.update(
+                        uri,
+                        ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) },
+                        null,
+                        null
+                    )
+                } catch (_: Throwable) {
+                }
                 val newUriStr = uri.toString()
                 _allRecordings.update { list -> list.map { if (it.fileURL == sourceFile.absolutePath) it.copy(fileURL = newUriStr) else it } }
-                try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+                try {
+                    persistRecordingsToPrefs()
+                } catch (_: Throwable) {
+                }
                 newUriStr
             } else {
-                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), targetRelativePath).apply { mkdirs() }
+                val dir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    targetRelativePath
+                ).apply { mkdirs() }
                 val outFile = File(dir, displayName)
                 sourceFile.copyTo(outFile, overwrite = true)
                 val newPath = outFile.absolutePath
                 _allRecordings.update { list -> list.map { if (it.fileURL == sourceFile.absolutePath) it.copy(fileURL = newPath) else it } }
-                try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+                try {
+                    persistRecordingsToPrefs()
+                } catch (_: Throwable) {
+                }
                 newPath
             }
         } catch (_: Throwable) {
@@ -2430,8 +2624,12 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun publishRecordingForVisibility(sourceFile: File): String? {
         val treeUriStr = settingsPrefs.getString(KEY_CUSTOM_RECORDING_TREE_URI, null)
-        if (!treeUriStr.isNullOrBlank()) return copyRecordingToSelectedTree(sourceFile) ?: copyRecordingToPublicDownloads(sourceFile, null)
-        if (!pendingRelativeRecordingPath.isNullOrBlank()) return copyRecordingToPublicDownloads(sourceFile, pendingRelativeRecordingPath)
+        if (!treeUriStr.isNullOrBlank()) return copyRecordingToSelectedTree(sourceFile)
+            ?: copyRecordingToPublicDownloads(sourceFile, null)
+        if (!pendingRelativeRecordingPath.isNullOrBlank()) return copyRecordingToPublicDownloads(
+            sourceFile,
+            pendingRelativeRecordingPath
+        )
         if (!lastRecordingUsedAbsoluteCustomPath) return copyRecordingToPublicDownloads(sourceFile, null)
         return null
     }
@@ -2483,13 +2681,20 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 finalizeWavRecording(wav, wavSampleRate, wavDataBytes)
             } catch (_: Throwable) {
             }
-            try { wav.close() } catch (_: Throwable) {}
+            try {
+                wav.close()
+            } catch (_: Throwable) {
+            }
             wavOut = null
             wavDataBytes = 0L
             recordingActiveFormat = null
 
             currentRecordingPath?.let { path ->
-                val f = try { File(path) } catch (_: Throwable) { null }
+                val f = try {
+                    File(path)
+                } catch (_: Throwable) {
+                    null
+                }
                 if (f != null && f.exists() && f.isFile) {
                     val displayName = nextRecordingDisplayName()
                     _allRecordings.update { list ->
@@ -2501,7 +2706,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                             fileURL = f.absolutePath,
                             customName = displayName
                         )
-                        try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+                        try {
+                            persistRecordingsToPrefs()
+                        } catch (_: Throwable) {
+                        }
                         newList
                     }
                     publishRecordingForVisibility(f)
@@ -2526,7 +2734,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
         try {
             // Signal EOS
-            val inIndex = try { codec.dequeueInputBuffer(10_000) } catch (_: Throwable) { -1 }
+            val inIndex = try {
+                codec.dequeueInputBuffer(10_000)
+            } catch (_: Throwable) {
+                -1
+            }
             if (inIndex >= 0) {
                 codec.queueInputBuffer(inIndex, 0, 0, recordingPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
             }
@@ -2542,15 +2754,27 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         } catch (_: Throwable) {
         }
 
-        try { codec.stop() } catch (_: Throwable) {}
-        try { codec.release() } catch (_: Throwable) {}
+        try {
+            codec.stop()
+        } catch (_: Throwable) {
+        }
+        try {
+            codec.release()
+        } catch (_: Throwable) {
+        }
 
         try {
             if (recordingMuxerStarted) {
-                try { muxer.stop() } catch (_: Throwable) {}
+                try {
+                    muxer.stop()
+                } catch (_: Throwable) {
+                }
             }
         } finally {
-            try { muxer.release() } catch (_: Throwable) {}
+            try {
+                muxer.release()
+            } catch (_: Throwable) {
+            }
         }
 
         recordingMuxerStarted = false
@@ -2559,7 +2783,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         recordingActiveFormat = null
 
         currentRecordingPath?.let { path ->
-            val f = try { File(path) } catch (_: Throwable) { null }
+            val f = try {
+                File(path)
+            } catch (_: Throwable) {
+                null
+            }
             if (f != null && f.exists() && f.isFile) {
                 val displayName = nextRecordingDisplayName()
                 _allRecordings.update { list ->
@@ -2571,7 +2799,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         fileURL = f.absolutePath,
                         customName = displayName
                     )
-                    try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+                    try {
+                        persistRecordingsToPrefs()
+                    } catch (_: Throwable) {
+                    }
                     newList
                 }
                 publishRecordingForVisibility(f)
@@ -2622,20 +2853,32 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 codec.start()
             } catch (t: Throwable) {
                 // Fallback to capture sample rate
-                try { codec.reset() } catch (_: Throwable) {}
+                try {
+                    codec.reset()
+                } catch (_: Throwable) {
+                }
                 codec.configure(buildAacFormat(sampleRate), null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
                 codec.start()
             }
         } catch (t: Throwable) {
-            try { codec.release() } catch (_: Throwable) {}
+            try {
+                codec.release()
+            } catch (_: Throwable) {
+            }
             throw IllegalStateException("Failed to initialize AAC encoder: ${t.message}", t)
         }
 
         val muxer = try {
             MediaMuxer(outFile.absolutePath, fmt.muxerFormat)
         } catch (t: Throwable) {
-            try { codec.stop() } catch (_: Throwable) {}
-            try { codec.release() } catch (_: Throwable) {}
+            try {
+                codec.stop()
+            } catch (_: Throwable) {
+            }
+            try {
+                codec.release()
+            } catch (_: Throwable) {
+            }
             throw IllegalStateException("Failed to initialize muxer: ${t.message}", t)
         }
 
@@ -2678,7 +2921,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
         var offset = 0
         while (offset < byteCount) {
-            val inIndex = try { codec.dequeueInputBuffer(0) } catch (_: Throwable) { -1 }
+            val inIndex = try {
+                codec.dequeueInputBuffer(0)
+            } catch (_: Throwable) {
+                -1
+            }
             if (inIndex < 0) break
 
             val inBuf = codec.getInputBuffer(inIndex) ?: break
@@ -2730,10 +2977,12 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         fun writeString(s: String) {
             raf.write(s.toByteArray(Charsets.US_ASCII))
         }
+
         fun writeLe16(v: Int) {
             raf.write(v and 0xFF)
             raf.write((v ushr 8) and 0xFF)
         }
+
         fun writeLe32(v: Long) {
             raf.write((v and 0xFF).toInt())
             raf.write(((v ushr 8) and 0xFF).toInt())
@@ -3096,7 +3345,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 if (clip.id != clipId) clip else clip.copy(customName = trimmed)
             }
         }
-        try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+        try {
+            persistRecordingsToPrefs()
+        } catch (_: Throwable) {
+        }
     }
 
 
@@ -3110,7 +3362,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         _allRecordings.update { list ->
             list.map { if (it.id == clipId) it.copy(deletedAt = System.currentTimeMillis()) else it }
         }
-        try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+        try {
+            persistRecordingsToPrefs()
+        } catch (_: Throwable) {
+        }
     }
 
     /** 恢复最近删除的录音 */
@@ -3118,7 +3373,10 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         _allRecordings.update { list ->
             list.map { if (it.id == clipId) it.copy(deletedAt = null) else it }
         }
-        try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+        try {
+            persistRecordingsToPrefs()
+        } catch (_: Throwable) {
+        }
     }
 
     /** 永久删除录音文件并从列表中移除 */
@@ -3132,15 +3390,20 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     try {
                         val app = getApplication<Application>()
                         app.contentResolver.delete(android.net.Uri.parse(clip.fileURL), null, null)
-                    } catch (_: Throwable) {}
+                    } catch (_: Throwable) {
+                    }
                 } else {
                     val f = File(clip.fileURL)
                     if (f.exists()) f.delete()
                 }
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+            }
         }
         _allRecordings.update { list -> list.filterNot { it.id == clipId } }
-        try { persistRecordingsToPrefs() } catch (_: Throwable) {}
+        try {
+            persistRecordingsToPrefs()
+        } catch (_: Throwable) {
+        }
     }
 
     // NOTE: The public controls/playback stubs are defined at the top of this file.
@@ -3416,6 +3679,7 @@ private class RtBiquadCascade(private var sampleRate: Int) {
 
     private var lastEqEnabled = false
     private var lastFilterGain = -1f
+
     // Store last bands list to avoid unnecessary recalc (assuming immutable list replacement)
     private var lastEqBands: List<AudioEngineViewModel.EqBand>? = null
     private var lastGlobalHpEnabled: Boolean = true
@@ -3640,7 +3904,6 @@ private class RtBiquadCascade(private var sampleRate: Int) {
         }
     }
 }
-
 
 
 private fun rtDesignRCLowPass(sampleRate: Int, cutoffHz: Float): RtBiquad {
