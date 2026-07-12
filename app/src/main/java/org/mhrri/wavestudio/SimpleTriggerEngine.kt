@@ -3,31 +3,37 @@ package org.mhrri.wavestudio
 import kotlin.math.*
 
 /**
- * Trigger engine — direct port of iOS WaveStudio AudioEngineManager trigger pipeline.
+ * Trigger engine — stabilises repetitive waveforms on screen.
  *
- * Pipeline:
- * 1. Adaptive threshold (max(userThr, RMS×0.10)) + Schmidt-trigger hysteresis crossing detection
- * 2. Period estimation via autocorrelation (refreshed every 8 frames) or crossing spacing
- * 3. Phase-locked crossing filtering — only crossings within ±22% of predicted period
- * 4. Multi-dimensional scoring: prediction(0.72) slope(0.18) symmetry(0.10) fingerprint(0.14)
- *    edge-consistency(0.08) ref-edge(0.20) anchor(0.10) phase(0.08) − half-cycle-alias(0.22)
- * 5. Phase stickiness — latch to predicted position when confidence marginal
- * 6. Window extraction — trigger point at 20% from left
+ * 7-step pipeline (driven at ~30 FPS):
+ * 1. Signal conditioning: conditioned mode → 156 Hz high-shelf (-40 dB) + 800 Hz 4th-order lowpass
+ * 2. Zero-crossing: dual-threshold hysteresis (Schmitt-trigger), holdoff 1 ms, fallback to simple scan
+ * 3. Period estimation: dual estimators (raw + 360 Hz lowpass autocorrelation), ±18 % jump clamp, EMA
+ * 4. Scoring: prediction(0.72) slope(0.18) symmetry(0.10) fingerprint(0.14)
+ *            edge-consistency(0.08) ref-edge(0.20) phase(0.08) − half-cycle-alias(0.22)
+ * 5. Phase stickiness: confidence < 0.46 or gap < 0.055 → latch to predicted position
+ * 6. Edge refinement (conditioned mode): offset EMA, ±18 sample search, deadband
+ * 7. Window extraction: trigger point at 20 % from left
  */
 internal class SimpleTriggerEngine(
     private val windowSize: Int = 512,
 ) {
     enum class Mode { OFF, RISING, FALLING }
 
+    /** Whether to apply internal conditioning filters before zero-crossing detection. */
+    enum class SourceMode {
+        CONDITIONED,
+        OUTPUT,
+    }
+
     data class Config(
         val mode: Mode,
         val sampleRateHz: Float,
         val preTriggerRatio: Float = 0.20f,
+        val sourceMode: SourceMode = SourceMode.OUTPUT,
         val globalBase: Long = 0L,
         val triggerThreshold: Float = 0.02f,
         val holdoffMs: Float = 1f,
-        /** Max local anchor index for extraction safety. */
-        val maxValidAnchor: Int = Int.MAX_VALUE,
     )
 
     data class Result(
@@ -39,43 +45,68 @@ internal class SimpleTriggerEngine(
         val freqHz: Float,
     )
 
-    // ── iOS constants ───────────────────────────────────────────────
+    // ── Constants ─────────────────────────────────────────────────
     private val predictionWeight = 0.72f
     private val slopeWeight = 0.18f
     private val symmetryWeight = 0.10f
-    private val historyWeight = 0.14f
+    private val fingerprintWeight = 0.14f
     private val edgeConsistencyWeight = 0.08f
     private val refEdgeConsistencyWeight = 0.20f
-    private val anchorWeight = 0.10f
     private val phaseContinuityWeight = 0.08f
     private val halfCycleAliasPenaltyVal = 0.22f
-    private val maxAcceptedPeriodJumpRatio = 0.30f
-    private val maxPredictionErrorRatio = 0.22f
+
+    private val maxAcceptedPeriodJumpRatio = 0.18f       // spec: ±18 %
+    private val maxPredictionErrorRatio = 0.22f           // phase-locked filter ±22 %
     private val predictionNeighborhoodRatio = 0.14f
-    private val minConfidenceForAcceptance = 0.46f
-    private val ambiguousScoreMargin = 0.055f
+    private val minConfidenceForAcceptance = 0.46f        // spec: < 0.46
+    private val ambiguousScoreMargin = 0.055f             // spec: < 0.055
     private val phaseStickinessMargin = 0.075f
     private val minConfidenceMargin = 0.07f
+    private val maxCrossingsToScore = 40
+    private val fingerprintSampleCount = 24
+
     private val hysteresisRatio = 0.18f
     private val hysteresisFloorVal = 0.002f
     private val rmsHysteresisRatioVal = 0.06f
-    private val phaseErrorEmaAlpha = 0.12f
-    private val fingerprintSampleCount = 24
-    private val edgeConsistencyRadiusVal = 3
-    private val maxCrossingsToScore = 192
-    private val maxFundamentalHz = 240f
-    private val minFundamentalHz = 1f
-    private val halfCycleAliasToleranceRatio = 0.12f
     private val weakSignalRmsFloorVal = 0.006f
-    private val assistLowPassHzVal = 360f
 
-    // ── state ──────────────────────────────────────────────────────
-    private var lastTriggerGlobalIdx: Long = Long.MIN_VALUE
+    private val edgeConsistencyRadius = 3
+
+    // ── State ─────────────────────────────────────────────────────
+    private var lastTriggerGlobalIdx = Long.MIN_VALUE
     private var estimatedPeriodSamples = 0f
     private var phaseErrorRatioEma = 0f
     private var lastTriggerFingerprint: FloatArray? = null
     private var pendingLocalAnchor = -1
     private var periodRefreshCounter = 0
+    private var conditionedOffsetEma = 0f
+
+    // biquad coefficient cache
+    private var cachedSampleRate = -1f
+    private var hsB0 = 0f;
+    private var hsB1 = 0f;
+    private var hsB2 = 0f;
+    private var hsA1 = 0f;
+    private var hsA2 = 0f
+    private var lp1B0 = 0f;
+    private var lp1B1 = 0f;
+    private var lp1B2 = 0f;
+    private var lp1A1 = 0f;
+    private var lp1A2 = 0f
+    private var lp2B0 = 0f;
+    private var lp2B1 = 0f;
+    private var lp2B2 = 0f;
+    private var lp2A1 = 0f;
+    private var lp2A2 = 0f
+    private var lp360B0 = 0f;
+    private var lp360B1 = 0f;
+    private var lp360B2 = 0f;
+    private var lp360A1 = 0f;
+    private var lp360A2 = 0f
+
+    // ═══════════════════════════════════════════════════════════════
+    // PUBLIC API
+    // ═══════════════════════════════════════════════════════════════
 
     fun process(signal: FloatArray, config: Config): Result {
         val n = signal.size
@@ -84,34 +115,47 @@ internal class SimpleTriggerEngine(
             return Result(0, 0, 0f, false, config.mode, 0f)
         }
 
-        // Resolve pending local anchor to global index
+        // Resolve pending local anchor
         if (pendingLocalAnchor >= 0 && config.globalBase >= 0) {
             lastTriggerGlobalIdx = config.globalBase + pendingLocalAnchor
             pendingLocalAnchor = -1
         }
 
-        val preferredAnchor = max(1, n / 5)
+        val preferredAnchor = max(1, n / 5)   // spec: 20 % from left
         val isRising = config.mode == Mode.RISING
 
-        // ── 1. Threshold + hysteresis ───────────────────────────────
-        val threshold = adaptiveThreshold(signal, config.triggerThreshold)
-        val rmsVal = rms(signal)
-        val hysteresis = maxOf(hysteresisFloorVal, abs(threshold) * hysteresisRatio, rmsVal * rmsHysteresisRatioVal)
+        // ── 1. Signal conditioning ─────────────────────────────────
+        val workSignal = if (config.sourceMode == SourceMode.CONDITIONED) {
+            applyConditioningFilters(signal, config.sampleRateHz)
+        } else {
+            signal
+        }
 
-        val crossingsRaw =
-            detectCrossings(signal, threshold, hysteresis, isRising, config.holdoffMs, config.sampleRateHz)
+        // ── 2. Threshold + hysteresis crossing detection ───────────
+        val threshold = adaptiveThreshold(workSignal, config.triggerThreshold)
+        val rmsVal = rms(workSignal)
+        val hysteresis = maxOf(
+            hysteresisFloorVal,
+            abs(threshold) * hysteresisRatio,
+            rmsVal * rmsHysteresisRatioVal
+        )
+        val crossingsRaw = detectCrossings(
+            workSignal, threshold, hysteresis, isRising, config.holdoffMs, config.sampleRateHz
+        )
         if (crossingsRaw.isEmpty()) {
             val fb = if (lastTriggerGlobalIdx >= 0) (lastTriggerGlobalIdx - config.globalBase).toInt()
                 .coerceIn(0, n - 1) else n / 2
             return Result(fb, estimatedPeriodSamples.roundToInt().coerceAtLeast(1), 0f, false, config.mode, 0f)
         }
 
-        // ── 2. Period estimation ────────────────────────────────────
+        // ── 3. Dual period estimation (raw + 360 Hz lowpass) ───────
         val weakFloor = max(abs(config.triggerThreshold) * 0.8f, weakSignalRmsFloorVal)
         if (rmsVal >= weakFloor && shouldRefreshPeriod()) {
-            val rawP = autocorrelationPeriod(signal, config.sampleRateHz)
-            if (rawP > 1f) {
-                estimatedPeriodSamples = stabilizedPeriod(estimatedPeriodSamples, rawP)
+            val rawP = autocorrelationPeriod(workSignal, config.sampleRateHz)
+            val lpP = lowpassAutocorrelationPeriod(workSignal, config.sampleRateHz, 360f)
+            val measured = chooseFundamentalCandidate(rawP, lpP, estimatedPeriodSamples)
+            if (measured > 0f) {
+                estimatedPeriodSamples = stabilizedPeriod(estimatedPeriodSamples, measured)
             }
         }
         // fallback: crossing spacing
@@ -120,54 +164,61 @@ internal class SimpleTriggerEngine(
             gaps.sort()
             estimatedPeriodSamples = stabilizedPeriod(estimatedPeriodSamples, gaps[gaps.size / 2].toFloat())
         }
+        // last resort: window fraction
+        if (estimatedPeriodSamples <= 0f) {
+            estimatedPeriodSamples = (n * 0.5f)
+        }
 
-        // ── 3. Reduce crossings ─────────────────────────────────────
+        // ── 4. Reduce + phase-locked filtering ─────────────────────
         val crossings = reduceCrossings(crossingsRaw, estimatedPeriodSamples, config.globalBase)
-        val maxAnchor = min(config.maxValidAnchor, n - 1)
-        val validCrossings = crossings.filter { it in 0..maxAnchor }
+        val validCrossings = crossings.filter { it in 0 until n }
         if (validCrossings.isEmpty()) {
             val fb = if (lastTriggerGlobalIdx >= 0) (lastTriggerGlobalIdx - config.globalBase).toInt()
                 .coerceIn(0, n - 1) else n / 2
             return Result(fb, estimatedPeriodSamples.roundToInt().coerceAtLeast(1), 0f, false, config.mode, 0f)
         }
 
-        // ── 4. Choose best crossing ─────────────────────────────────
-        val holdoffSamples = ((config.holdoffMs * config.sampleRateHz) / 1000f).roundToInt()
-
-        // Shortcut: single crossing with no reliable period — just use it
-        val chosen: Int
-        if (validCrossings.size == 1 && estimatedPeriodSamples <= 0f) {
-            chosen = validCrossings[0]
-        } else {
-            chosen = chooseBestCrossing(
-                validCrossings, signal, estimatedPeriodSamples, preferredAnchor, isRising,
-                holdoffSamples, config.globalBase, n
+        // Single crossing shortcut
+        if (validCrossings.size == 1) {
+            val chosen = validCrossings[0]
+            val globalChosen = config.globalBase + chosen
+            updateState(globalChosen, config)
+            return Result(
+                chosen, estimatedPeriodSamples.roundToInt().coerceAtLeast(1), 0.9f, true, config.mode,
+                if (estimatedPeriodSamples > 1) config.sampleRateHz / estimatedPeriodSamples else 0f
             )
         }
 
-        // ── 5. Update state ─────────────────────────────────────────
-        val globalChosen = config.globalBase + chosen
+        // ── 5. Choose best crossing (scoring + stickiness) ─────────
+        val holdoffSamples = ((config.holdoffMs * config.sampleRateHz) / 1000f).roundToInt()
+        val chosen = chooseBestCrossing(
+            validCrossings, workSignal, estimatedPeriodSamples, preferredAnchor, isRising,
+            holdoffSamples, config.globalBase, n
+        )
 
-        // Primary period estimate: actual anchor-to-anchor distance (always accurate)
-        if (lastTriggerGlobalIdx >= 0) {
-            val anchorDelta = globalChosen - lastTriggerGlobalIdx
-            if (anchorDelta > 1) {
-                estimatedPeriodSamples = stabilizedPeriod(estimatedPeriodSamples, anchorDelta.toFloat())
-            }
-            val phaseErr = min(abs(anchorDelta - estimatedPeriodSamples) / max(estimatedPeriodSamples, 1f), 1f)
-            phaseErrorRatioEma = phaseErrorRatioEma * (1f - phaseErrorEmaAlpha) + phaseErr * phaseErrorEmaAlpha
+        // ── 6. Edge refinement (conditioned mode only) ─────────────
+        val finalAnchor = if (config.sourceMode == SourceMode.CONDITIONED) {
+            refineEdge(workSignal, signal, chosen, estimatedPeriodSamples, isRising)
+        } else {
+            chosen
         }
-        lastTriggerGlobalIdx = globalChosen
 
-        // fingerprint
-        val fpStart = max(0, chosen - preferredAnchor)
-        val fpLen = min(fingerprintSampleCount, n - fpStart)
-        if (fpLen > 0) lastTriggerFingerprint = computeFingerprint(signal, fpStart, fpLen)
+        // ── 7. Update state ────────────────────────────────────────
+        val globalChosen = config.globalBase + finalAnchor
+        updateState(globalChosen, config)
 
-        val periodInt = estimatedPeriodSamples.roundToInt().coerceAtLeast(1)
+        val locked = estimatedPeriodSamples > 0
+        val confidence = if (locked) 0.85f else 0.3f
         val freqHz = if (estimatedPeriodSamples > 1) config.sampleRateHz / estimatedPeriodSamples else 0f
 
-        return Result(chosen, periodInt, 0.85f, true, config.mode, freqHz)
+        return Result(
+            finalAnchor,
+            estimatedPeriodSamples.roundToInt().coerceAtLeast(1),
+            confidence,
+            locked,
+            config.mode,
+            freqHz
+        )
     }
 
     fun seekAnchorTo(localAnchor: Int) {
@@ -191,13 +242,110 @@ internal class SimpleTriggerEngine(
         phaseErrorRatioEma = 0f
         lastTriggerFingerprint = null
         pendingLocalAnchor = -1
+        conditionedOffsetEma = 0f
+    }
+
+    private fun updateState(globalChosen: Long, config: Config) {
+        if (lastTriggerGlobalIdx >= 0) {
+            val anchorDelta = globalChosen - lastTriggerGlobalIdx
+            if (anchorDelta > 1) {
+                estimatedPeriodSamples = stabilizedPeriod(estimatedPeriodSamples, anchorDelta.toFloat())
+            }
+            if (estimatedPeriodSamples > 0) {
+                val phaseErr = min(abs(anchorDelta - estimatedPeriodSamples) / max(estimatedPeriodSamples, 1f), 1f)
+                phaseErrorRatioEma = phaseErrorRatioEma * 0.8f + phaseErr * 0.2f
+            }
+        }
+        lastTriggerGlobalIdx = globalChosen
+        periodRefreshCounter = (periodRefreshCounter + 1) % 8
+    }
+
+    private fun shouldRefreshPeriod(): Boolean = periodRefreshCounter == 0
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 1: SIGNAL CONDITIONING
+    // ═══════════════════════════════════════════════════════════════
+
+    private fun ensureBiquadCoeffs(sampleRateHz: Float) {
+        if (cachedSampleRate == sampleRateHz) return
+        cachedSampleRate = sampleRateHz
+
+        // 156 Hz high-shelf, -40 dB, slope 0.7
+        val hs = designHighShelf(sampleRateHz, 156f, 0.7f, -40f)
+        hsB0 = hs[0]; hsB1 = hs[1]; hsB2 = hs[2]; hsA1 = hs[3]; hsA2 = hs[4]
+
+        // 800 Hz 4th-order Butterworth = two cascaded biquads
+        // Butterworth Qs: 0.5412, 1.3066
+        val l1 = designLowPass(sampleRateHz, 800f, 0.5412f)
+        lp1B0 = l1[0]; lp1B1 = l1[1]; lp1B2 = l1[2]; lp1A1 = l1[3]; lp1A2 = l1[4]
+        val l2 = designLowPass(sampleRateHz, 800f, 1.3066f)
+        lp2B0 = l2[0]; lp2B1 = l2[1]; lp2B2 = l2[2]; lp2A1 = l2[3]; lp2A2 = l2[4]
+
+        // 360 Hz lowpass for dual period estimator
+        val l3 = designLowPass(sampleRateHz, 360f, 0.7071f)
+        lp360B0 = l3[0]; lp360B1 = l3[1]; lp360B2 = l3[2]; lp360A1 = l3[3]; lp360A2 = l3[4]
+    }
+
+    /** Two-stage conditioning: 156 Hz high-shelf (-40 dB) → 800 Hz 4th-order lowpass. */
+    private fun applyConditioningFilters(signal: FloatArray, sampleRateHz: Float): FloatArray {
+        ensureBiquadCoeffs(sampleRateHz)
+        val n = signal.size
+        val out = FloatArray(n)
+        // biquad state
+        var hsX1 = 0f;
+        var hsX2 = 0f;
+        var hsY1 = 0f;
+        var hsY2 = 0f
+        var lp1X1 = 0f;
+        var lp1X2 = 0f;
+        var lp1Y1 = 0f;
+        var lp1Y2 = 0f
+        var lp2X1 = 0f;
+        var lp2X2 = 0f;
+        var lp2Y1 = 0f;
+        var lp2Y2 = 0f
+
+        for (i in 0 until n) {
+            // high-shelf
+            val x = signal[i]
+            val yHs = hsB0 * x + hsB1 * hsX1 + hsB2 * hsX2 - hsA1 * hsY1 - hsA2 * hsY2
+            hsX2 = hsX1; hsX1 = x; hsY2 = hsY1; hsY1 = yHs
+            // lowpass stage 1
+            val yL1 = lp1B0 * yHs + lp1B1 * lp1X1 + lp1B2 * lp1X2 - lp1A1 * lp1Y1 - lp1A2 * lp1Y2
+            lp1X2 = lp1X1; lp1X1 = yHs; lp1Y2 = lp1Y1; lp1Y1 = yL1
+            // lowpass stage 2
+            val yL2 = lp2B0 * yL1 + lp2B1 * lp2X1 + lp2B2 * lp2X2 - lp2A1 * lp2Y1 - lp2A2 * lp2Y2
+            lp2X2 = lp2X1; lp2X1 = yL1; lp2Y2 = lp2Y1; lp2Y1 = yL2
+            out[i] = yL2
+        }
+        return out
+    }
+
+    /** Apply 360 Hz lowpass biquad for the auxiliary period estimator. */
+    private fun applyLowpass360(signal: FloatArray, sampleRateHz: Float): FloatArray {
+        ensureBiquadCoeffs(sampleRateHz)
+        val n = signal.size
+        val out = FloatArray(n)
+        var x1 = 0f;
+        var x2 = 0f;
+        var y1 = 0f;
+        var y2 = 0f
+        for (i in 0 until n) {
+            val x = signal[i]
+            val y = lp360B0 * x + lp360B1 * x1 + lp360B2 * x2 - lp360A1 * y1 - lp360A2 * y2
+            x2 = x1; x1 = x; y2 = y1; y1 = y
+            out[i] = y
+        }
+        return out
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // THRESHOLD & CROSSING DETECTION (matches iOS)
+    // STEP 2: ZERO-CROSSING DETECTION (hysteresis + holdoff)
     // ═══════════════════════════════════════════════════════════════
 
-    private fun adaptiveThreshold(samples: FloatArray, userThr: Float) = max(abs(userThr), rms(samples) * 0.10f)
+    private fun adaptiveThreshold(samples: FloatArray, userThr: Float): Float {
+        return max(abs(userThr), rms(samples) * 0.10f)
+    }
 
     private fun rms(samples: FloatArray): Float {
         if (samples.isEmpty()) return 0f
@@ -205,6 +353,13 @@ internal class SimpleTriggerEngine(
         return sqrt(e / samples.size)
     }
 
+    /**
+     * Dual-threshold hysteresis (Schmitt-trigger):
+     *   rising: arm below lowThr, fire when crossing above highThr
+     *   falling: arm above highThr, fire when crossing below lowThr
+     * Holdoff suppresses crossings for 1 ms after a fire.
+     * Fallback: simple zero-crossing scan if hysteresis finds nothing.
+     */
     private fun detectCrossings(
         signal: FloatArray, threshold: Float, hysteresis: Float, isRising: Boolean,
         holdoffMs: Float, sampleRateHz: Float
@@ -222,57 +377,88 @@ internal class SimpleTriggerEngine(
         for (i in 1 until n - 1) {
             val prev = signal[i - 1];
             val curr = signal[i]
-            val slope = curr - prev
-            val slopePass = if (isRising) slope > 0f else slope < 0f
             if (isRising) {
-                if (curr <= lowThr) armed = true
-                if (armed && slopePass && prev < lowThr && curr >= highThr) {
-                    if (i - lastFire >= holdoffS) {
-                        result.add(i); lastFire = i
-                    }
-                    armed = false
+                if (prev <= lowThr) armed = true
+                if (armed && prev <= highThr && curr > highThr && (i - lastFire) >= holdoffS) {
+                    result.add(i); lastFire = i; armed = false
                 }
             } else {
-                if (curr >= highThr) armed = true
-                if (armed && slopePass && prev > highThr && curr <= lowThr) {
-                    if (i - lastFire >= holdoffS) {
-                        result.add(i); lastFire = i
-                    }
-                    armed = false
+                if (prev >= highThr) armed = true
+                if (armed && prev >= lowThr && curr < lowThr && (i - lastFire) >= holdoffS) {
+                    result.add(i); lastFire = i; armed = false
                 }
             }
         }
-        // fallback
+
+        // fallback: simple zero-crossing
         if (result.isEmpty()) {
             for (i in 1 until n) {
-                val sl = signal[i] - signal[i - 1]
-                val sp = if (isRising) sl > 0f else sl < 0f
-                if (!sp) continue
-                if (isRising && signal[i - 1] < threshold && signal[i] >= threshold) result.add(i)
-                else if (!isRising && signal[i - 1] > threshold && signal[i] <= threshold) result.add(i)
+                if (isRising && signal[i - 1] < 0f && signal[i] >= 0f) result.add(i)
+                else if (!isRising && signal[i - 1] > 0f && signal[i] <= 0f) result.add(i)
             }
         }
         return result
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // PERIOD ESTIMATION
+    // STEP 3: DUAL PERIOD ESTIMATION
     // ═══════════════════════════════════════════════════════════════
 
-    private fun shouldRefreshPeriod(): Boolean {
-        periodRefreshCounter++
-        val stride = if (estimatedPeriodSamples > 0) 8 else 1
-        return periodRefreshCounter % stride == 0
-    }
-
+    /** Autocorrelation period on raw (de-meaned) signal with lag bias toward longer periods. */
     private fun autocorrelationPeriod(signal: FloatArray, sampleRateHz: Float): Float {
         val n = signal.size
         if (n < 64) return 0f
         val mean = signal.sum() / n
         val c = FloatArray(n) { signal[it] - mean }
         val sr = max(sampleRateHz, 1f)
-        val minLag = max(4, (sr / maxFundamentalHz).roundToInt())
-        val maxLag = min(n - 4, (sr / minFundamentalHz).roundToInt())
+        val minLag = max(4, (sr / 2000f).roundToInt())    // 2 kHz max
+        val maxLag = min(n - 4, (sr / 20f).roundToInt())  // 20 Hz min
+        if (maxLag <= minLag) return 0f
+        var bestLag = -1;
+        var bestScore = -1e9f
+        val lagSpan = max(maxLag - minLag, 1).toFloat()
+        for (lag in minLag..maxLag) {
+            var dot = 0f;
+            var e0 = 0f;
+            var e1 = 0f
+            val lim = n - lag; if (lim <= 0) continue
+            for (i in 0 until lim) {
+                dot += c[i] * c[i + lag]; e0 += c[i] * c[i]; e1 += c[i + lag] * c[i + lag]
+            }
+            val denom = sqrt(max(e0 * e1, 1e-18f))
+            val corr = if (denom > 0f) dot / denom else 0f
+            val bias = 0.75f + 0.25f * (lag - minLag) / lagSpan  // prefer longer periods
+            val score = corr * bias
+            if (score > bestScore) {
+                bestScore = score; bestLag = lag
+            }
+        }
+        return if (bestLag > 0 && bestScore > 0.15f) bestLag.toFloat() else 0f
+    }
+
+    /** Autocorrelation period on 360 Hz lowpassed signal (auxiliary estimator). */
+    private fun lowpassAutocorrelationPeriod(signal: FloatArray, sampleRateHz: Float, cutoffHz: Float): Float {
+        val n = signal.size
+        if (n < 64) return 0f
+        // Use cached 360 Hz lowpass biquad
+        ensureBiquadCoeffs(sampleRateHz)
+        val lp = FloatArray(n)
+        var x1 = 0f;
+        var x2 = 0f;
+        var y1 = 0f;
+        var y2 = 0f
+        for (i in 0 until n) {
+            val x = signal[i]
+            val y = lp360B0 * x + lp360B1 * x1 + lp360B2 * x2 - lp360A1 * y1 - lp360A2 * y2
+            x2 = x1; x1 = x; y2 = y1; y1 = y
+            lp[i] = y
+        }
+        // de-mean
+        val mean = lp.sum() / n
+        val c = FloatArray(n) { lp[it] - mean }
+        val sr = max(sampleRateHz, 1f)
+        val minLag = max(4, (sr / 2000f).roundToInt())
+        val maxLag = min(n - 4, (sr / 20f).roundToInt())
         if (maxLag <= minLag) return 0f
         var bestLag = -1;
         var bestScore = -1e9f
@@ -296,16 +482,37 @@ internal class SimpleTriggerEngine(
         return if (bestLag > 0 && bestScore > 0.15f) bestLag.toFloat() else 0f
     }
 
+    /** Choose best candidate from dual estimators, preferring consistent ones. */
+    private fun chooseFundamentalCandidate(raw: Float, lp: Float, prev: Float): Float {
+        val candidates = listOf(raw, lp).filter { it > 0f }
+        if (candidates.isEmpty()) return if (prev > 0f) prev else 0f
+        if (candidates.size == 1) return candidates[0]
+        // prefer the one closer to previous estimate
+        if (prev > 0f) {
+            val dRaw = abs(raw - prev) / prev
+            val dLp = abs(lp - prev) / prev
+            return if (dRaw <= dLp) raw else lp
+        }
+        // average
+        return candidates.average().toFloat()
+    }
+
+    /** EMA smoothing with ±18 % jump clamp. */
     private fun stabilizedPeriod(prev: Float, measured: Float): Float {
         if (prev <= 0f) return measured
         if (measured <= 0f) return prev
         val r = measured / max(prev, 1f)
-        if (r !in 0.5f..2.0f) return measured
-        return prev * 0.82f + measured * 0.18f
+        // clamp jump to ±18 %
+        val clamped = when {
+            r > 1f + maxAcceptedPeriodJumpRatio -> prev * (1f + maxAcceptedPeriodJumpRatio)
+            r < 1f - maxAcceptedPeriodJumpRatio -> prev * (1f - maxAcceptedPeriodJumpRatio)
+            else -> measured
+        }
+        return prev * 0.82f + clamped * 0.18f
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // CHOOSE BEST CROSSING (matches iOS chooseBestTriggerCrossing)
+    // STEP 4: SCORING + PHASE-LOCKED FILTERING
     // ═══════════════════════════════════════════════════════════════
 
     private data class Scored(val index: Int, val score: Float, val predictionErrorRatio: Float)
@@ -315,127 +522,125 @@ internal class SimpleTriggerEngine(
         preferredAnchor: Int, isRising: Boolean, holdoffSamples: Int,
         globalBase: Long, n: Int
     ): Int {
-        // ── prediction context ──────────────────────────────────────
-        data class PredCtx(val predictedLocal: Float, val period: Float, val closestIdx: Int?)
+        if (crossings.isEmpty()) return preferredAnchor.coerceIn(0, n - 1)
 
-        val predCtx: PredCtx? = if (estimatedPeriod > 1f && lastTriggerGlobalIdx >= 0) {
-            val predictedLocal = (lastTriggerGlobalIdx + estimatedPeriod) - globalBase
+        // prediction context
+        val predCtx: Triple<Float, Float, Int?>? = if (estimatedPeriod > 1f && lastTriggerGlobalIdx >= 0) {
+            val predictedGlobal = lastTriggerGlobalIdx + estimatedPeriod.toLong()
+            val predictedLocal = (predictedGlobal - globalBase).toFloat()
             val neighborhood = max(estimatedPeriod * predictionNeighborhoodRatio, 2f)
-            val filtered = crossings.filter { abs(it - predictedLocal) <= neighborhood }
-            val scoped = filtered.ifEmpty { crossings }
-            PredCtx(predictedLocal, estimatedPeriod, scoped.minByOrNull { abs(it - predictedLocal) })
+            val reduced = reduceCrossings(crossings, estimatedPeriod, globalBase)
+            val filtered = reduced.filter { abs(it - predictedLocal) <= neighborhood }
+            val scoped = if (filtered.isNotEmpty()) filtered else reduced
+            val closest = scoped.minByOrNull { abs(it - predictedLocal) }
+            Triple(predictedLocal, estimatedPeriod, closest)
         } else null
 
-        // ── scope to prediction neighborhood ────────────────────────
-        val scopedCrossings = if (predCtx != null) {
-            val neighborhood = max(predCtx.period * predictionNeighborhoodRatio, 2f)
-            crossings.filter { abs(it - predCtx.predictedLocal) <= neighborhood }.ifEmpty { crossings }
-        } else crossings
-
-        // ── phase-locked filtering ──────────────────────────────────
-        val phaseLocked: List<Int> = if (estimatedPeriod > 1f && lastTriggerGlobalIdx >= 0) {
+        // phase-locked filtering
+        val phaseLocked = if (estimatedPeriod > 1f && lastTriggerGlobalIdx >= 0) {
             val minD = estimatedPeriod * (1f - maxPredictionErrorRatio)
             val maxD = estimatedPeriod * (1f + maxPredictionErrorRatio)
-            scopedCrossings.filter { c ->
+            crossings.filter { c ->
                 val delta = ((globalBase + c) - lastTriggerGlobalIdx).toFloat()
                 delta in minD..maxD
-            }.ifEmpty { scopedCrossings }
-        } else scopedCrossings
+            }.ifEmpty { crossings }
+        } else crossings
 
         if (phaseLocked.isEmpty()) {
-            // stable fallback: pick crossing closest to preferredAnchor or prediction
-            val target = predCtx?.predictedLocal?.toInt()?.coerceIn(0, n - 1) ?: preferredAnchor
-            return crossings.minByOrNull { abs(it - target) } ?: crossings.first()
+            return predCtx?.third ?: crossings.minByOrNull { abs(it - preferredAnchor) } ?: crossings.first()
         }
 
-        // ── score each candidate ────────────────────────────────────
-        val maxAbsSlope =
-            max(phaseLocked.maxOfOrNull { if (it in 1 until n - 1) abs(samples[it + 1] - samples[it - 1]) else 0f }
-                ?: 0f, 1e-7f)
-        val anchorRange = max(n - preferredAnchor, 1).toFloat()
-
+        // scoring
         val scored = phaseLocked.mapNotNull { c ->
-            if (c !in 1 until n - 1) return@mapNotNull null
+            if (c !in 2 until n - 2) return@mapNotNull null
+            val slope = abs(samples[c + 1] - samples[c - 1])
 
-            // holdoff
-            if (holdoffSamples > 0 && lastTriggerGlobalIdx >= 0) {
-                val globalC = globalBase + c
-                val delta = (globalC - lastTriggerGlobalIdx).toInt()
-                if (delta in 1 until holdoffSamples) return@mapNotNull null
-            }
+            // prediction score
+            val predScore = if (predCtx != null) {
+                val dist = abs(c - predCtx.first)
+                val tol = max(estimatedPeriod * 0.35f, 4f)
+                exp(-(dist * dist) / (2f * tol * tol))
+            } else 0.5f
 
-            val globalC = globalBase + c
-            val slopeVal = abs(samples[c + 1] - samples[c - 1])
-            val slopeScore = slopeVal / maxAbsSlope
-            val anchorScore = 1f - min(abs(c - preferredAnchor).toFloat() / anchorRange, 1f)
-            val edgeScore = localEdgeConsistency(samples, c, isRising)
-            val refEdgeScore = localEdgeConsistency(samples, c, true)
+            // slope score (normalised)
+            val maxSlope = phaseLocked.map { cc ->
+                if (cc in 1 until n - 1) abs(samples[cc + 1] - samples[cc - 1]) else 0f
+            }.maxOrNull()?.coerceAtLeast(1e-6f) ?: 1e-6f
+            val slopeScore = (slope / maxSlope).coerceIn(0f, 1f)
 
-            var predictionScore = 0f
-            var predictionErrorRatio = 1f
-            var aliasPenalty = 0f
-            var phaseScore = 0f
-
-            if (estimatedPeriod > 1f && lastTriggerGlobalIdx >= 0) {
-                val delta = globalC - lastTriggerGlobalIdx
-                val predicted = lastTriggerGlobalIdx + estimatedPeriod
-                val error = abs(globalC - predicted)
-                val sigma = max(estimatedPeriod * 0.35f, 1f)
-                predictionScore = exp(-(error * error) / (2f * sigma * sigma))
-                predictionErrorRatio = min(error / max(estimatedPeriod, 1f), 2f)
-
-                val halfPeriod = estimatedPeriod * 0.5f
-                val halfErr = abs(delta - halfPeriod)
-                val halfTol = max(estimatedPeriod * halfCycleAliasToleranceRatio, 1f)
-                if (halfErr <= halfTol) {
-                    aliasPenalty = halfCycleAliasPenaltyVal * (1f - min(halfErr / halfTol, 1f))
-                }
-                val emaSigma = max(estimatedPeriod * max(0.06f, phaseErrorRatioEma * 0.8f), 1f)
-                phaseScore = exp(-(error * error) / (2f * emaSigma * emaSigma))
-            }
-
+            // symmetry score
             val symScore = halfWaveSymmetry(samples, c, estimatedPeriod)
-            val historyScore = if (lastTriggerFingerprint != null && lastTriggerFingerprint!!.isNotEmpty()) {
-                val fpLen = min(fingerprintSampleCount, n - max(0, c - preferredAnchor))
-                if (fpLen > 0) fingerprintSimilarity(
-                    computeFingerprint(samples, max(0, c - preferredAnchor), fpLen),
-                    lastTriggerFingerprint!!
-                ) else 0f
+
+            // fingerprint score
+            val fpScore = fingerprintScore(samples, c, n)
+
+            // edge consistency
+            val ecScore = localEdgeConsistency(samples, c, isRising)
+
+            // ref edge consistency
+            val refFp = lastTriggerFingerprint
+            val refScore = if (refFp != null && refFp.isNotEmpty()) {
+                val fp = computeFingerprint(
+                    samples,
+                    max(0, c - preferredAnchor),
+                    min(n, c + preferredAnchor) - max(0, c - preferredAnchor)
+                )
+                fingerprintSimilarity(fp, refFp)
+            } else 0.5f
+
+            // phase continuity
+            val phaseScore = if (predCtx != null && estimatedPeriod > 0) {
+                val err = abs(c - predCtx.first) / estimatedPeriod
+                max(0f, 1f - err)
+            } else 0.5f
+
+            // half-cycle alias penalty
+            val aliasPenalty = if (estimatedPeriod > 4f) {
+                val halfP = estimatedPeriod * 0.5f
+                val errFromHalf = abs((c - (predCtx?.first ?: c.toFloat())) % halfP)
+                val errFromFull = abs(errFromHalf - halfP)
+                val minErr = min(errFromHalf, errFromFull)
+                val halfTol = estimatedPeriod * 0.08f
+                if (minErr < halfTol) -halfCycleAliasPenaltyVal * (1f - minErr / halfTol) else 0f
             } else 0f
 
-            val combined = slopeWeight * slopeScore + predictionWeight * predictionScore +
-                    symmetryWeight * symScore + historyWeight * historyScore +
-                    edgeConsistencyWeight * edgeScore + refEdgeConsistencyWeight * refEdgeScore +
-                    anchorWeight * anchorScore + phaseContinuityWeight * phaseScore - aliasPenalty
+            val total = predScore * predictionWeight +
+                    slopeScore * slopeWeight +
+                    symScore * symmetryWeight +
+                    fpScore * fingerprintWeight +
+                    ecScore * edgeConsistencyWeight +
+                    refScore * refEdgeConsistencyWeight +
+                    phaseScore * phaseContinuityWeight +
+                    aliasPenalty
 
-            Scored(c, combined, predictionErrorRatio)
+            Scored(c, total, predScore)
         }.sortedByDescending { it.score }
 
         if (scored.isEmpty()) {
-            val target = predCtx?.predictedLocal?.toInt()?.coerceIn(0, n - 1) ?: preferredAnchor
-            return phaseLocked.minByOrNull { abs(it - target) } ?: phaseLocked.first()
+            return predCtx?.third ?: crossings.minByOrNull { abs(it - preferredAnchor) } ?: crossings.first()
         }
 
         val best = scored[0]
         val second = scored.getOrElse(1) { Scored(0, -999f, 1f) }
 
-        // ── phase stickiness (matches iOS) ──────────────────────────
-        if (predCtx != null && predCtx.closestIdx != null) {
-            val predictedCandidate = scored.find { it.index == predCtx.closestIdx }
+        // ── 5. Phase stickiness ────────────────────────────────────
+        if (predCtx != null && predCtx.third != null) {
+            val predictedCandidate = scored.find { it.index == predCtx.third }
             if (predictedCandidate != null) {
-                val scoreGap = best.score - second.score
-                val isAmbiguous = scoreGap < ambiguousScoreMargin || best.score < minConfidenceForAcceptance
-                val predictionClearlyBetter =
-                    (best.predictionErrorRatio - predictedCandidate.predictionErrorRatio) > 0.08f
-                val stickPenalty = best.score - predictedCandidate.score
-                if (isAmbiguous && predictionClearlyBetter && stickPenalty < phaseStickinessMargin)
-                    return predCtx.closestIdx
+                val isAmbiguous = best.score < minConfidenceForAcceptance ||
+                        (best.score - second.score) < ambiguousScoreMargin
+                val predictionClearlyBetter = predictedCandidate.score > best.score * 1.05f
+                val stickPenalty = abs(best.index - predCtx.first) / max(estimatedPeriod, 1f)
+                if (isAmbiguous && predictionClearlyBetter && stickPenalty < phaseStickinessMargin) {
+                    return predCtx.third!!
+                }
             }
         }
 
         if (best.score >= minConfidenceForAcceptance) return best.index
-        if (predCtx?.closestIdx != null && (best.score - second.score) < minConfidenceMargin)
-            return predCtx.closestIdx
+        if (predCtx?.third != null && (best.score - second.score) < minConfidenceMargin) {
+            return predCtx.third!!
+        }
         return best.index
     }
 
@@ -466,12 +671,53 @@ internal class SimpleTriggerEngine(
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // SCORING HELPERS (matches iOS)
+    // STEP 6: EDGE REFINEMENT (conditioned mode)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * In conditioned mode the crossing sits on the filtered signal.
+     * Search ±18 samples in the raw signal for the best zero-crossing.
+     * Track offset EMA with deadband to prevent jitter.
+     */
+    private fun refineEdge(
+        condSignal: FloatArray, rawSignal: FloatArray,
+        condCrossing: Int, estimatedPeriod: Float, isRising: Boolean
+    ): Int {
+        val n = rawSignal.size
+        val searchRadius = 18
+        val baseOffset = conditionedOffsetEma.roundToInt()
+        val centre = (condCrossing + baseOffset).coerceIn(searchRadius, n - searchRadius - 1)
+
+        var bestIdx = condCrossing  // fallback to conditioned crossing
+        var bestSlope = -1f
+
+        for (offset in -searchRadius..searchRadius) {
+            val idx = centre + offset
+            if (idx !in 1 until n - 1) continue
+            val isMatch = if (isRising) rawSignal[idx - 1] < 0f && rawSignal[idx] >= 0f
+            else rawSignal[idx - 1] > 0f && rawSignal[idx] <= 0f
+            if (!isMatch) continue
+            val slope = abs(rawSignal[idx + 1] - rawSignal[idx - 1])
+            if (slope > bestSlope) {
+                bestSlope = slope; bestIdx = idx
+            }
+        }
+
+        // update offset EMA with deadband
+        val rawOffset = (bestIdx - condCrossing).toFloat()
+        if (abs(rawOffset - conditionedOffsetEma) > 2f) {  // deadband = 2 samples
+            conditionedOffsetEma = conditionedOffsetEma * 0.8f + rawOffset * 0.2f
+        }
+        return bestIdx
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SCORING HELPERS
     // ═══════════════════════════════════════════════════════════════
 
     private fun localEdgeConsistency(samples: FloatArray, crossing: Int, rising: Boolean): Float {
-        if (samples.size < 3) return 0f
-        val radius = max(1, edgeConsistencyRadiusVal)
+        val n = samples.size
+        val radius = edgeConsistencyRadius
         var before = 0f;
         var after = 0f;
         var bc = 0;
@@ -480,7 +726,7 @@ internal class SimpleTriggerEngine(
             val l = crossing - o; if (l >= 0) {
                 before += samples[l]; bc++
             }
-            val r = crossing + o; if (r < samples.size) {
+            val r = crossing + o; if (r < n) {
                 after += samples[r]; ac++
             }
         }
@@ -498,15 +744,27 @@ internal class SimpleTriggerEngine(
         val rs = crossing + half - radius
         val n = samples.size
         if (ls < 0 || rs < 0 || ls + radius * 2 >= n || rs + radius * 2 >= n) return 0f
-        var dot = 0f;
-        var e0 = 0f;
-        var e1 = 0f
-        for (o in 0..radius * 2) {
-            val a = samples[ls + o];
-            val b = samples[rs + o]; dot += a * (-b); e0 += a * a; e1 += b * b
+        var sumXY = 0f;
+        var sumXX = 0f;
+        var sumYY = 0f
+        for (k in 0 until radius * 2) {
+            val lv = samples[ls + k];
+            val rv = samples[rs + k]
+            sumXY += lv * rv; sumXX += lv * lv; sumYY += rv * rv
         }
-        val denom = sqrt(max(e0 * e1, 1e-18f))
-        return if (denom > 0f) max(0f, dot / denom) else 0f
+        val denom = sqrt(sumXX * sumYY)
+        return if (denom > 1e-12f) max(0f, sumXY / denom) else 0f
+    }
+
+    private fun fingerprintScore(samples: FloatArray, crossing: Int, n: Int): Float {
+        val refFp = lastTriggerFingerprint ?: return 0.5f
+        val fpLen = min(fingerprintSampleCount, n)
+        val fp = computeFingerprint(
+            samples,
+            max(0, crossing - fpLen / 2),
+            min(n, crossing + fpLen / 2) - max(0, crossing - fpLen / 2)
+        )
+        return fingerprintSimilarity(fp, refFp)
     }
 
     private fun computeFingerprint(samples: FloatArray, start: Int, length: Int): FloatArray {
@@ -534,5 +792,43 @@ internal class SimpleTriggerEngine(
         var dot = 0f
         for (i in 0 until count) dot += a[i] * b[i]
         return dot.coerceIn(0f, 1f)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // BIQUAD FILTER DESIGN (RBJ Audio EQ Cookbook)
+    // ═══════════════════════════════════════════════════════════════
+
+    /** Returns [b0, b1, b2, a1, a2] normalised by a0. */
+    private fun designLowPass(sampleRateHz: Float, cutoffHz: Float, q: Float): FloatArray {
+        val w0 = 2f * PI.toFloat() * cutoffHz / sampleRateHz
+        val cosW0 = cos(w0);
+        val sinW0 = sin(w0)
+        val alpha = sinW0 / (2f * q)
+        val b0 = (1f - cosW0) / 2f
+        val b1 = 1f - cosW0
+        val b2 = (1f - cosW0) / 2f
+        val a0 = 1f + alpha
+        val a1 = -2f * cosW0
+        val a2 = 1f - alpha
+        return floatArrayOf(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+
+    /** High-shelf with gainDb (negative = cut), slope parameter S. */
+    private fun designHighShelf(sampleRateHz: Float, centerHz: Float, slope: Float, gainDb: Float): FloatArray {
+        val w0 = 2f * PI.toFloat() * centerHz / sampleRateHz
+        val cosW0 = cos(w0);
+        val sinW0 = sin(w0)
+        val a = 10f.pow(gainDb / 40f)
+        val s = slope.coerceIn(0.1f, 2f)
+        val alphaTerm = max((a + 1f / a) * (1f / s - 1f) + 2f, 0f)
+        val alpha = sinW0 / 2f * sqrt(alphaTerm)
+        val twoSqrtAAlpha = 2f * sqrt(a) * alpha
+        val b0 = a * ((a + 1f) - (a - 1f) * cosW0 + twoSqrtAAlpha)
+        val b1 = 2f * a * ((a - 1f) - (a + 1f) * cosW0)
+        val b2 = a * ((a + 1f) - (a - 1f) * cosW0 - twoSqrtAAlpha)
+        val a0 = (a + 1f) + (a - 1f) * cosW0 + twoSqrtAAlpha
+        val a1 = -2f * ((a - 1f) + (a + 1f) * cosW0)
+        val a2 = (a + 1f) + (a - 1f) * cosW0 - twoSqrtAAlpha
+        return floatArrayOf(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
     }
 }
