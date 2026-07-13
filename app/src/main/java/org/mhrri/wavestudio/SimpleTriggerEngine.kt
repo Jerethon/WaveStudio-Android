@@ -196,6 +196,9 @@ internal class SimpleTriggerEngine(
             holdoffSamples, config.globalBase, n
         )
 
+        // store fingerprint for next frame's scoring
+        lastTriggerFingerprint = computeFingerprint(workSignal, chosen, n)
+
         // ── 6. Edge refinement (conditioned mode only) ─────────────
         val finalAnchor = if (config.sourceMode == SourceMode.CONDITIONED) {
             refineEdge(workSignal, signal, chosen, estimatedPeriodSamples, isRising)
@@ -550,6 +553,15 @@ internal class SimpleTriggerEngine(
             return predCtx?.third ?: crossings.minByOrNull { abs(it - preferredAnchor) } ?: crossings.first()
         }
 
+        // pre-compute maxSlope for normalisation
+        var maxSlope = 1e-6f
+        for (cc in phaseLocked) {
+            if (cc in 1 until n - 1) {
+                val sl = abs(samples[cc + 1] - samples[cc - 1])
+                if (sl > maxSlope) maxSlope = sl
+            }
+        }
+
         // scoring
         val scored = phaseLocked.mapNotNull { c ->
             if (c !in 2 until n - 2) return@mapNotNull null
@@ -562,10 +574,7 @@ internal class SimpleTriggerEngine(
                 exp(-(dist * dist) / (2f * tol * tol))
             } else 0.5f
 
-            // slope score (normalised)
-            val maxSlope = phaseLocked.map { cc ->
-                if (cc in 1 until n - 1) abs(samples[cc + 1] - samples[cc - 1]) else 0f
-            }.maxOrNull()?.coerceAtLeast(1e-6f) ?: 1e-6f
+            // slope score (normalised — maxSlope pre-computed above)
             val slopeScore = (slope / maxSlope).coerceIn(0f, 1f)
 
             // symmetry score
@@ -597,7 +606,7 @@ internal class SimpleTriggerEngine(
             // half-cycle alias penalty
             val aliasPenalty = if (estimatedPeriod > 4f) {
                 val halfP = estimatedPeriod * 0.5f
-                val errFromHalf = abs((c - (predCtx?.first ?: c.toFloat())) % halfP)
+                val errFromHalf = abs((c - (predCtx?.first ?: preferredAnchor.toFloat())) % halfP)
                 val errFromFull = abs(errFromHalf - halfP)
                 val minErr = min(errFromHalf, errFromFull)
                 val halfTol = estimatedPeriod * 0.08f

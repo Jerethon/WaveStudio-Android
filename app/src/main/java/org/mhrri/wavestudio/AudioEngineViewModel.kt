@@ -1388,20 +1388,21 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 val now = SystemClock.elapsedRealtime()
                                 if (res != null && res.mode != SimpleTriggerEngine.Mode.OFF) {
                                     _triggerResult.value = res
-                                    if (res.locked && res.periodSamples > 0) {
-                                        lastGoodTriggerMs = now
-                                        triggerRingBase = (fetchStart + res.anchorIndex) % ring.size
-                                        // Extract window from uiFiltered (contiguous, no ring-wrap issues).
-                                        val preCount = (windowSamples * trigCfg.preTriggerRatio).toInt()
-                                            .coerceIn(0, windowSamples - 1)
-                                        val trigWin = FloatArray(windowSamples)
-                                        val trigRingStart = ((triggerRingBase - preCount + ring.size) % ring.size)
-                                        for (i in 0 until windowSamples) {
-                                            trigWin[i] = ringFiltered[(trigRingStart + i) % ring.size]
-                                        }
-                                        _triggeredWindow.value =
-                                            downsamplePeakFloatArray(trigWin, 0, windowSamples, targetPoints)
+                                    // Always update the display, even if not yet locked.
+                                    // Without this, waveform freezes on first frame or when
+                                    // period estimation temporarily fails.
+                                    lastGoodTriggerMs = now
+                                    triggerRingBase = (fetchStart + res.anchorIndex) % ring.size
+                                    // Extract window from ringFiltered (matching engine input domain).
+                                    val preCount = (windowSamples * trigCfg.preTriggerRatio).toInt()
+                                        .coerceIn(0, windowSamples - 1)
+                                    val trigWin = FloatArray(windowSamples)
+                                    val trigRingStart = ((triggerRingBase - preCount + ring.size) % ring.size)
+                                    for (i in 0 until windowSamples) {
+                                        trigWin[i] = ringFiltered[(trigRingStart + i) % ring.size]
                                     }
+                                    _triggeredWindow.value =
+                                        downsamplePeakFloatArray(trigWin, 0, windowSamples, targetPoints)
                                 }
                             }
                         }
@@ -1952,21 +1953,19 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 val now2 = SystemClock.elapsedRealtime()
                                 if (res2 != null && res2.mode != SimpleTriggerEngine.Mode.OFF) {
                                     _triggerResult.value = res2
-                                    if (res2.locked && res2.periodSamples > 0) {
-                                        lastGoodTriggerMs = now2
-                                        triggerRingAnchorBase = (fetchStart + res2.anchorIndex) % ring.size
-                                        // Extract from ringFiltered (contiguous ring data, no stale reads)
-                                        val fetchPreCount = (fetchSamples * trigCfg2.preTriggerRatio).toInt()
-                                            .coerceIn(0, fetchSamples - 1)
-                                        val trigWin = FloatArray(fetchSamples)
-                                        val trigRingStart2 =
-                                            ((triggerRingAnchorBase - fetchPreCount + ring.size) % ring.size)
-                                        for (i in 0 until fetchSamples) {
-                                            trigWin[i] = ringFiltered[(trigRingStart2 + i) % ring.size]
-                                        }
-                                        _triggeredWindow.value =
-                                            downsamplePeakFloatArray(trigWin, 0, fetchSamples, targetPoints)
+                                    // Always update the display, even if not yet locked.
+                                    lastGoodTriggerMs = now2
+                                    triggerRingAnchorBase = (fetchStart + res2.anchorIndex) % ring.size
+                                    val fetchPreCount = (fetchSamples * trigCfg2.preTriggerRatio).toInt()
+                                        .coerceIn(0, fetchSamples - 1)
+                                    val trigWin = FloatArray(fetchSamples)
+                                    val trigRingStart2 =
+                                        ((triggerRingAnchorBase - fetchPreCount + ring.size) % ring.size)
+                                    for (i in 0 until fetchSamples) {
+                                        trigWin[i] = ringFiltered[(trigRingStart2 + i) % ring.size]
                                     }
+                                    _triggeredWindow.value =
+                                        downsamplePeakFloatArray(trigWin, 0, fetchSamples, targetPoints)
                                 }
                             }
                         }
