@@ -224,20 +224,24 @@
     <string name="about_dev_section_icon_design">Icon Design</string>
     <string name="about_dev_section_english_proofreading">English Proofreading</string>
 
+    <string name="about_dev_section_past_contributors">Past Contributors</string>
+
     <string-array name="about_dev_main_members">
         <item>02B4806長-02001</item>
-        <item>TEP-28WG01</item>
     </string-array>
     <string-array name="about_dev_tester_members">
         <item>某地铁迷_</item>
         <item>莓喵の小风扇</item>
     </string-array>
     <string-array name="about_dev_icon_design_members">
-        <item>TEP-28WG01</item>
+    </string-array>
+
+    <string-array name="about_dev_past_contributors_members">
+        <item>TEP-28WG01 (Development, Icon Design)</item>
+        <item>PulsMeister (English Proofreading)</item>
+        <item>TriumphantCreator (English Proofreading)</item>
     </string-array>
     <string-array name="about_dev_english_proofreading_members">
-        <item>PulsMeister</item>
-        <item>TriumphantCreator</item>
     </string-array>
 
     <string name="trigger_pre_trigger_ratio_value">Pre-trigger ratio: %1$s</string>

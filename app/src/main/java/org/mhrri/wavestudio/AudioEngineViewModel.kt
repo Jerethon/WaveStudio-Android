@@ -112,7 +112,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
             get() = (1000f / hz).roundToInt().toLong().coerceAtLeast(1L)
     }
 
-    private val settingsPrefs: SharedPreferences by lazy(LazyThreadSafetyMode.NONE) {
+    private val settingsPrefs: SharedPreferences by lazy {
         getApplication<Application>().getSharedPreferences(SETTINGS_PREFS_NAME, Context.MODE_PRIVATE)
     }
 
@@ -170,7 +170,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                     )
                 }
             }
-            if (list.isNotEmpty()) _allRecordings.value = list
+            if (list.isNotEmpty()) _allRecordings.update { list }
         } catch (_: Throwable) {
         }
     }
@@ -279,7 +279,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun seekPlaybackTo(positionMs: Long) {
-        // no-op stub; keep signature for UI
+        player?.seekTo(positionMs.coerceAtLeast(0L))
     }
 
     /**
@@ -696,13 +696,16 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     // ===== Filtered recording (PCM -> filter -> AAC -> M4A) =====
     private var recordingStartMs: Long = 0L
     private var currentRecordingPath: String? = null
+    @Volatile
     private var recordingMuxer: MediaMuxer? = null
+    @Volatile
     private var recordingCodec: MediaCodec? = null
     private var recordingTrackIndex: Int = -1
     private var recordingMuxerStarted: Boolean = false
     private var recordingPtsUs: Long = 0L
 
     // WAV (raw PCM) recording
+    @Volatile
     private var wavOut: java.io.RandomAccessFile? = null
     private var wavDataBytes: Long = 0L
     private var wavSampleRate: Int = 44100
@@ -1111,6 +1114,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 val ringFiltered = FloatArray(maxWindowSamples)
                 var ringWrite = 0
                 var ringSize = 0
+                var totalSamplesWritten = 0L
 
                 // UI 波形用：复用一个实时滤波器 + 复用数组，避免 applyFiltersBiquad() 产生大量 List<Float>
                 val uiWaveformFilter = RtBiquadCascade(sampleRate)
@@ -1296,6 +1300,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         ringWrite = (ringWrite + 1) % ring.size
                         if (ringSize < ring.size) ringSize++
                     }
+                    totalSamplesWritten += read
 
                     // ===== UI 波形更新限流：避免每个 audio block 都触发 Compose 重组造成卡顿 =====
                     val nowUi = SystemClock.elapsedRealtime()
@@ -1310,9 +1315,15 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         val windowSamples = max(64, (sampleRate * (_windowMs.value / 1000f)).toInt())
                             .coerceAtMost(ring.size)
 
-                        // fetchStart from ringWrite - fillCount so ALL fillCount samples
-                        // are fresh (no stale ring-wrap data causing discontinuity).
-                        val fillCount = min(windowSamples * 2, ring.size)
+                        // Trigger analysis needs enough history to contain repeated edges even
+                        // when the visible time base is very short. Keep 100 ms (at least two
+                        // 20 Hz periods) when available; the display still uses only its newest
+                        // requested window below.
+                        val minTriggerAnalysisSamples = (sampleRate / 10).coerceAtLeast(640)
+                        val fillCount = min(
+                            max(windowSamples * 2, minTriggerAnalysisSamples),
+                            ringSize,
+                        )
                         val fetchStart = (ringWrite - fillCount + ring.size) % ring.size
 
                         for (i in 0 until fillCount) {
@@ -1341,13 +1352,22 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                             uiWaveformFilter.process(uiSlice, uiFiltered, fillCount)
                         }
 
-                        // UI display: raw and filtered waveforms at full window resolution
+                        // UI display is the newest requested portion of the analysis buffer.
+                        // This keeps the non-triggered fallback and the trigger source in sync.
                         val targetPoints = 512
+                        val displayCount = min(windowSamples, fillCount)
+                        val displayStart = fillCount - displayCount
                         val publishedSpanMs = _windowMs.value
-                        val downRaw = downsamplePeakFloatArray(uiSlice, 0, windowSamples, targetPoints = targetPoints)
+                        val downRaw = downsamplePeakFloatArray(
+                            uiSlice, displayStart, displayStart + displayCount, targetPoints = targetPoints
+                        )
                         val downFiltered =
-                            downsamplePeakFloatArray(uiFiltered, 0, windowSamples, targetPoints = targetPoints)
-                        val immersiveFiltered = resampleLinearFloatArray(uiFiltered, 0, windowSamples, targetPoints)
+                            downsamplePeakFloatArray(
+                                uiFiltered, displayStart, displayStart + displayCount, targetPoints = targetPoints
+                            )
+                        val immersiveFiltered = resampleLinearFloatArray(
+                            uiFiltered, displayStart, displayStart + displayCount, targetPoints
+                        )
 
                         _rawWaveform.value = downRaw
                         _filteredWaveform.value = downFiltered
@@ -1355,56 +1375,42 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         _publishedWaveformSpanMs.value = publishedSpanMs.coerceAtLeast(_windowMs.value)
                         markWaveformPublished()
 
-                        // Simple trigger: engine reads from uiFiltered (same fresh data as UI).
-                        // seekAnchorTo() keeps internal state coherent across frames.
-                        // On lock, _triggeredWindow is extracted from trigSrc (same data the
-                        // engine processed) aligned to the trigger anchor. Since trigSrc and
-                        // uiFiltered have the same length (windowSamples), the time span is
-                        // identical to the non-triggered view.
+                        // ── Real trigger engine ──
                         val triggerArmedNow = _triggerEnabled
-                        if (triggerArmedNow || _pendingTimeWindowUpdate.value) {
-                            _pendingTimeWindowUpdate.value = false
-
-                            if (triggerRingBase < 0) {
-                                triggerRingBase = fetchStart
-                            }
-
-                            if (triggerRingBase >= 0) {
-                                val trigCfg = SimpleTriggerEngine.Config(
-                                    mode = if (triggerArmedNow) SimpleTriggerEngine.Mode.RISING else SimpleTriggerEngine.Mode.OFF,
+                        if (triggerArmedNow) {
+                            try {
+                                val trigSignal = uiFiltered.copyOfRange(0, fillCount)
+                                val triggerCfg = SimpleTriggerEngine.Config(
+                                    mode = SimpleTriggerEngine.Mode.RISING,
                                     sampleRateHz = sampleRate.toFloat(),
-                                    preTriggerRatio = 0.30f,
-                                    globalBase = fetchStart.toLong(),
+                                    preTriggerRatio = 0.20f,
+                                    sourceMode = SimpleTriggerEngine.SourceMode.OUTPUT,
+                                    globalBase = totalSamplesWritten - fillCount,
+                                    triggerThreshold = 0.02f,
+                                    holdoffMs = 1f,
                                 )
+                                val trigResult = triggerEngine.process(trigSignal, triggerCfg)
+                                _triggerResult.value = trigResult
 
-                                val trigSrc = uiFiltered.copyOfRange(0, fillCount)
-                                // Engine maintains global state internally via lastTriggerGlobalIdx.
-                                // No seekAnchorTo() — it would corrupt global state with clamped local offset.
-                                val res = try {
-                                    triggerEngine.process(trigSrc, trigCfg)
-                                } catch (_: Throwable) {
-                                    null
-                                }
-                                val now = SystemClock.elapsedRealtime()
-                                if (res != null && res.mode != SimpleTriggerEngine.Mode.OFF) {
-                                    _triggerResult.value = res
-                                    // Always update the display, even if not yet locked.
-                                    // Without this, waveform freezes on first frame or when
-                                    // period estimation temporarily fails.
-                                    lastGoodTriggerMs = now
-                                    triggerRingBase = (fetchStart + res.anchorIndex) % ring.size
-                                    // Extract window from ringFiltered (matching engine input domain).
-                                    val preCount = (windowSamples * trigCfg.preTriggerRatio).toInt()
-                                        .coerceIn(0, windowSamples - 1)
-                                    val trigWin = FloatArray(windowSamples)
-                                    val trigRingStart = ((triggerRingBase - preCount + ring.size) % ring.size)
-                                    for (i in 0 until windowSamples) {
-                                        trigWin[i] = ringFiltered[(trigRingStart + i) % ring.size]
-                                    }
+                                if (trigResult.locked) {
+                                    val trigWindow = triggerEngine.extractWindow(
+                                        trigSignal, trigResult, displayCount, 0.20f
+                                    )
                                     _triggeredWindow.value =
-                                        downsamplePeakFloatArray(trigWin, 0, windowSamples, targetPoints)
+                                        downsamplePeakFloatArray(trigWindow, 0, trigWindow.size, targetPoints)
+                                } else {
+                                    _triggeredWindow.value = downFiltered
                                 }
+                            } catch (t: Throwable) {
+                                Log.e("WaveStudio", "Trigger engine error", t)
+                                _triggeredWindow.value = downFiltered
                             }
+                        } else {
+                            _triggerResult.value = null
+                            _triggeredWindow.value = floatArrayOf()
+                        }
+                        if (_pendingTimeWindowUpdate.value) {
+                            _pendingTimeWindowUpdate.value = false
                         }
                     }
                 }
@@ -1721,6 +1727,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
                 var ringWrite = 0
                 var ringSize = 0
+                var totalSamplesWritten = 0L
                 var lastUiUpdateAt = 0L
                 // Trigger processing: now runs inline with UI publish, no independent cadence needed
                 var lastGoodTriggerMs = 0L
@@ -1847,6 +1854,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                         ringWrite = (ringWrite + 1) % ring.size
                         if (ringSize < ring.size) ringSize++
                     }
+                    totalSamplesWritten += chunkSize
 
                     val track = ensureMonitorStarted()
                     if (track != null) {
@@ -1883,11 +1891,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                             .coerceAtMost(ring.size)
                         val triggerArmed = _triggerEnabled
                         val monitorOn = _isMonitoring.value
-                        val extraSamples = (windowSamples * 0.45f).toInt()
-                        val minTriggerSamples = if (triggerArmed) 640 else 0
-                        val fetchSamples = min(ringSize, max(windowSamples + extraSamples, minTriggerSamples))
+                        val minTriggerAnalysisSamples = (sampleRate / 10).coerceAtLeast(640)
+                        val analysisSamples = max(windowSamples * 2, minTriggerAnalysisSamples)
+                        val fetchSamples = min(ringSize, analysisSamples)
                         if (fetchSamples > 0) {
-                            val fillCount = min(fetchSamples * 2, ring.size)
+                            val fillCount = fetchSamples
                             val fetchStart = (ringWrite - fillCount + ring.size) % ring.size
                             for (i in 0 until fillCount) {
                                 uiSlice[i] = ring[(fetchStart + i) % ring.size]
@@ -1920,12 +1928,20 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 monitorOn -> 384
                                 else -> 704
                             }
+                            val displayCount = min(windowSamples, fillCount)
+                            val displayStart = fillCount - displayCount
                             val downRaw =
-                                downsamplePeakFloatArray(uiSlice, 0, fetchSamples, targetPoints = targetPoints)
+                                downsamplePeakFloatArray(
+                                    uiSlice, displayStart, displayStart + displayCount, targetPoints = targetPoints
+                                )
                             val downFiltered =
-                                downsamplePeakFloatArray(uiFiltered, 0, fetchSamples, targetPoints = targetPoints)
-                            val immersiveFiltered = resampleLinearFloatArray(uiFiltered, 0, fetchSamples, targetPoints)
-                            val publishedSpanMs = _windowMs.value * (fetchSamples.toFloat() / windowSamples.toFloat())
+                                downsamplePeakFloatArray(
+                                    uiFiltered, displayStart, displayStart + displayCount, targetPoints = targetPoints
+                                )
+                            val immersiveFiltered = resampleLinearFloatArray(
+                                uiFiltered, displayStart, displayStart + displayCount, targetPoints
+                            )
+                            val publishedSpanMs = _windowMs.value
 
                             _rawWaveform.value = downRaw
                             _filteredWaveform.value = downFiltered
@@ -1933,40 +1949,42 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                             _publishedWaveformSpanMs.value = publishedSpanMs.coerceAtLeast(_windowMs.value)
                             markWaveformPublished()
 
-                            // Simple trigger for imported signal path
+                            // ── Real trigger engine (imported signal) ──
                             val triggerArmedNow2 = _triggerEnabled
-                            if (triggerArmedNow2 || _pendingTimeWindowUpdate.value) {
-                                _pendingTimeWindowUpdate.value = false
-                                val trigCfg2 = SimpleTriggerEngine.Config(
-                                    mode = if (triggerArmedNow2) SimpleTriggerEngine.Mode.RISING else SimpleTriggerEngine.Mode.OFF,
-                                    sampleRateHz = sampleRate.toFloat(),
-                                    preTriggerRatio = 0.30f,
-                                    globalBase = fetchStart.toLong(),
-                                )
-                                val trigSrc2 = uiFiltered.copyOfRange(0, fetchSamples)
-                                // Engine maintains global state internally — no seekAnchorTo needed.
-                                val res2 = try {
-                                    triggerEngine.process(trigSrc2, trigCfg2)
-                                } catch (_: Throwable) {
-                                    null
-                                }
-                                val now2 = SystemClock.elapsedRealtime()
-                                if (res2 != null && res2.mode != SimpleTriggerEngine.Mode.OFF) {
-                                    _triggerResult.value = res2
-                                    // Always update the display, even if not yet locked.
-                                    lastGoodTriggerMs = now2
-                                    triggerRingAnchorBase = (fetchStart + res2.anchorIndex) % ring.size
-                                    val fetchPreCount = (fetchSamples * trigCfg2.preTriggerRatio).toInt()
-                                        .coerceIn(0, fetchSamples - 1)
-                                    val trigWin = FloatArray(fetchSamples)
-                                    val trigRingStart2 =
-                                        ((triggerRingAnchorBase - fetchPreCount + ring.size) % ring.size)
-                                    for (i in 0 until fetchSamples) {
-                                        trigWin[i] = ringFiltered[(trigRingStart2 + i) % ring.size]
+                            if (triggerArmedNow2) {
+                                try {
+                                    val trigSignal = uiFiltered.copyOfRange(0, fillCount)
+                                    val triggerCfg = SimpleTriggerEngine.Config(
+                                        mode = SimpleTriggerEngine.Mode.RISING,
+                                        sampleRateHz = sampleRate.toFloat(),
+                                        preTriggerRatio = 0.20f,
+                                        sourceMode = SimpleTriggerEngine.SourceMode.OUTPUT,
+                                        globalBase = totalSamplesWritten - fillCount,
+                                        triggerThreshold = 0.02f,
+                                        holdoffMs = 1f,
+                                    )
+                                    val trigResult = triggerEngine.process(trigSignal, triggerCfg)
+                                    _triggerResult.value = trigResult
+
+                                    if (trigResult.locked) {
+                                        val trigWindow = triggerEngine.extractWindow(
+                                            trigSignal, trigResult, displayCount, 0.20f
+                                        )
+                                        _triggeredWindow.value =
+                                            downsamplePeakFloatArray(trigWindow, 0, trigWindow.size, targetPoints)
+                                    } else {
+                                        _triggeredWindow.value = downFiltered
                                     }
-                                    _triggeredWindow.value =
-                                        downsamplePeakFloatArray(trigWin, 0, fetchSamples, targetPoints)
+                                } catch (t: Throwable) {
+                                    Log.e("WaveStudio", "Trigger engine error (imported)", t)
+                                    _triggeredWindow.value = downFiltered
                                 }
+                            } else {
+                                _triggerResult.value = null
+                                _triggeredWindow.value = floatArrayOf()
+                            }
+                            if (_pendingTimeWindowUpdate.value) {
+                                _pendingTimeWindowUpdate.value = false
                             }
                         }
                     }
@@ -2224,10 +2242,15 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     override fun onCleared() {
         stopPlayback()
-        // 确保资源释放（不要阻塞主线程）
+        // Cancel any in-flight stop — but don't rely on viewModelScope (it's cancelled after onCleared returns).
         recordingStopJob?.cancel()
-        viewModelScope.launch(Dispatchers.Default) {
-            stopRecordingInternalBlocking()
+        // Use NonCancellable so the cleanup runs even after the owning scope is cancelled.
+        // A brief blocking call here is acceptable: the ViewModel is being destroyed, and
+        // we must finalize the recording file to avoid corruption.
+        kotlinx.coroutines.runBlocking {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Default) {
+                stopRecordingInternalBlocking()
+            }
         }
         monitorTrack?.let {
             try {

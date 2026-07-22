@@ -115,7 +115,8 @@ fun ImmersiveScreen(
     // ===== 触发开关：开/关（开启时使用升沿 + 自相关辅助） =====
     fun parseTriggerMode(name: String): SimpleTriggerEngine.Mode = when (name) {
         SimpleTriggerEngine.Mode.OFF.name -> SimpleTriggerEngine.Mode.OFF
-        else -> SimpleTriggerEngine.Mode.RISING
+        SimpleTriggerEngine.Mode.FALLING.name -> SimpleTriggerEngine.Mode.FALLING
+        else -> SimpleTriggerEngine.Mode.RISING // Migrates legacy persisted "ON" values.
     }
 
     val triggerModeNameInitial = remember(triggerPrefs) {
@@ -139,7 +140,7 @@ fun ImmersiveScreen(
     }
 
     fun nextTriggerModeName(name: String): String = when (name) {
-        SimpleTriggerEngine.Mode.OFF.name -> "ON"
+        SimpleTriggerEngine.Mode.OFF.name -> SimpleTriggerEngine.Mode.RISING.name
         else -> SimpleTriggerEngine.Mode.OFF.name
     }
 
@@ -308,7 +309,13 @@ fun ImmersiveScreen(
                                     Spacer(Modifier.weight(1f))
                                     Switch(
                                         checked = triggerMode != SimpleTriggerEngine.Mode.OFF,
-                                        onCheckedChange = { on -> triggerModeName = if (on) "ON" else SimpleTriggerEngine.Mode.OFF.name }
+                                        onCheckedChange = { on ->
+                                            triggerModeName = if (on) {
+                                                SimpleTriggerEngine.Mode.RISING.name
+                                            } else {
+                                                SimpleTriggerEngine.Mode.OFF.name
+                                            }
+                                        }
                                     )
                                 }
                             },

@@ -694,7 +694,7 @@ internal fun StartupNoteDialog(
 
 // Data classes for About dialog sections
 internal data class AboutDialogAboutSection(val title: String, val bullets: List<String>)
-internal data class ContributorSection(val title: String, val members: List<String>)
+internal data class ContributorSection(val title: String, val members: List<String>, val past: Boolean = false)
 
 @Composable
 internal fun AboutDialog(
@@ -762,6 +762,11 @@ internal fun AboutDialog(
         ContributorSection(
             title = stringResource(R.string.about_dev_section_english_proofreading),
             members = context.resources.getStringArray(R.array.about_dev_english_proofreading_members).toList(),
+        ),
+        ContributorSection(
+            title = stringResource(R.string.about_dev_section_past_contributors),
+            members = context.resources.getStringArray(R.array.about_dev_past_contributors_members).toList(),
+            past = true,
         ),
     )
 
@@ -1157,7 +1162,7 @@ private fun ContributorsFullScreenDialog(
                                 .padding(horizontal = 16.dp, vertical = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(16.dp),
                         ) {
-                            sections.forEach { section ->
+                            sections.filter { it.members.isNotEmpty() }.forEach { section ->
                                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                     Text(
                                         text = section.title,
@@ -1165,7 +1170,7 @@ private fun ContributorsFullScreenDialog(
                                         color = MaterialTheme.colorScheme.primary,
                                     )
                                     section.members.forEach { member ->
-                                        AboutBullet(member)
+                                        AboutBullet(member, color = if (section.past) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 }
                             }
@@ -1248,7 +1253,7 @@ private fun CommunityDialog(
 }
 
 @Composable
-private fun AboutBullet(text: String) {
+private fun AboutBullet(text: String, color: Color = MaterialTheme.colorScheme.onSurfaceVariant) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.Top,
@@ -1262,7 +1267,7 @@ private fun AboutBullet(text: String) {
         Text(
             text = text,
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = color,
         )
     }
 }

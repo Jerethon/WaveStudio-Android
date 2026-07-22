@@ -212,20 +212,24 @@
     <string name="about_dev_section_icon_design">软件图标设计</string>
     <string name="about_dev_section_english_proofreading">英语校对</string>
 
+    <string name="about_dev_section_past_contributors">过往贡献者</string>
+
     <string-array name="about_dev_main_members">
         <item>02B4806長-02001</item>
-        <item>TEP-28WG01</item>
     </string-array>
     <string-array name="about_dev_tester_members">
         <item>某地铁迷_</item>
         <item>莓喵の小风扇</item>
     </string-array>
     <string-array name="about_dev_icon_design_members">
-        <item>TEP-28WG01</item>
+    </string-array>
+
+    <string-array name="about_dev_past_contributors_members">
+        <item>TEP-28WG01（开发、图标设计）</item>
+        <item>PulsMeister（英语校对）</item>
+        <item>TriumphantCreator（英语校对）</item>
     </string-array>
     <string-array name="about_dev_english_proofreading_members">
-        <item>PulsMeister</item>
-        <item>TriumphantCreator</item>
     </string-array>
 
 
