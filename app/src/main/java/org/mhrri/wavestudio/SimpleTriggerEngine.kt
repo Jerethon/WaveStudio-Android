@@ -5,29 +5,21 @@ import kotlin.math.*
 /**
  * Trigger engine — stabilises repetitive waveforms on screen.
  *
- * 5-step pipeline (driven at ~30 FPS):
- * 1. Signal conditioning: conditioned mode → 156 Hz high-shelf (-40 dB) + 800 Hz 4th-order lowpass
- * 2. Zero-crossing: dual-threshold hysteresis (Schmitt-trigger), holdoff 1 ms, fallback to simple scan
- * 3. Cross-correlation: slope-finder template correlation, peak normalized as confidence
- * 4. Hysteresis lock/bypass: dual-threshold (lock > 0.20, bypass < 0.08) with state memory
- * 5. Edge refinement: ±16 sample nearest-zero-crossing search
+ * 4-step pipeline (driven at ~30 FPS):
+ * 1. Zero-crossing: dual-threshold hysteresis (Schmitt-trigger), holdoff 1 ms, fallback to simple scan
+ * 2. Cross-correlation: slope-finder template correlation, peak normalized as confidence
+ * 3. Hysteresis lock/bypass: dual-threshold (lock > 0.20, bypass < 0.08) with state memory
+ * 4. Edge refinement: ±16 sample nearest-zero-crossing search
  */
 internal class SimpleTriggerEngine(
     private val windowSize: Int = 512,
 ) {
     enum class Mode { OFF, RISING, FALLING }
 
-    /** Whether to apply internal conditioning filters before zero-crossing detection. */
-    enum class SourceMode {
-        CONDITIONED,
-        OUTPUT,
-    }
-
     data class Config(
         val mode: Mode,
         val sampleRateHz: Float,
         val preTriggerRatio: Float = 0.20f,
-        val sourceMode: SourceMode = SourceMode.OUTPUT,
         val globalBase: Long = 0L,
         val triggerThreshold: Float = 0.02f,
         val holdoffMs: Float = 1f,
@@ -63,23 +55,6 @@ internal class SimpleTriggerEngine(
     // Precomputed slope-finder template (built on first use)
     private var slopeFinder: FloatArray? = null
 
-    // biquad coefficient cache
-    private var cachedSampleRate = -1f
-    private var hsB0 = 0f;
-    private var hsB1 = 0f;
-    private var hsB2 = 0f;
-    private var hsA1 = 0f;
-    private var hsA2 = 0f
-    private var lp1B0 = 0f;
-    private var lp1B1 = 0f;
-    private var lp1B2 = 0f;
-    private var lp1A1 = 0f;
-    private var lp1A2 = 0f
-    private var lp2B0 = 0f;
-    private var lp2B1 = 0f;
-    private var lp2B2 = 0f;
-    private var lp2A1 = 0f;
-    private var lp2A2 = 0f
     // ═══════════════════════════════════════════════════════════════
     // PUBLIC API
     // ═══════════════════════════════════════════════════════════════
@@ -100,14 +75,9 @@ internal class SimpleTriggerEngine(
         val preferredAnchor = max(1, n / 5)   // spec: 20 % from left
         val isRising = config.mode == Mode.RISING
 
-        // ── 1. Signal conditioning ─────────────────────────────────
-        val workSignal = if (config.sourceMode == SourceMode.CONDITIONED) {
-            applyConditioningFilters(signal, config.sampleRateHz)
-        } else {
-            signal
-        }
+        val workSignal = signal
 
-        // ── 2. Threshold + hysteresis crossing detection ───────────
+        // ── 1. Threshold + hysteresis crossing detection ───────────
         val threshold = adaptiveThreshold(workSignal, config.triggerThreshold)
         val rmsVal = rms(workSignal)
         val hysteresis = maxOf(
@@ -124,7 +94,7 @@ internal class SimpleTriggerEngine(
             return Result(fb, estimatedPeriodSamples.roundToInt().coerceAtLeast(1), 0f, false, config.mode, 0f)
         }
 
-        // ── 3. Cross-correlation with slope-finder template ──────
+        // ── 2. Cross-correlation with slope-finder template ──────
         // Build precomputed slope-finder once
         val sf = slopeFinder ?: buildSlopeFinder(kernelSize, slopeWidth).also { slopeFinder = it }
 
@@ -151,7 +121,7 @@ internal class SimpleTriggerEngine(
         // Normalize peak: divide by kernelSize for amplitude-independent measure
         val normPeak = (peakVal / kernelSize).coerceIn(0f, 1f)
 
-        // ── 4. Hysteresis lock/bypass ─────────────────────────────
+        // ── 3. Hysteresis lock/bypass ─────────────────────────────
         val prevLocked = correlationLocked
         correlationLocked = when {
             normPeak > lockThreshold       -> true
@@ -171,7 +141,7 @@ internal class SimpleTriggerEngine(
         val bestCrossing = crossingsRaw.minByOrNull { abs(it - corrCenter) }
             ?: corrCenter.coerceIn(0, n - 1)
 
-        // ── 5. Edge refinement ────────────────────────────────────
+        // ── 4. Edge refinement ────────────────────────────────────
         val finalAnchor = findNearestZeroCross(workSignal, bestCrossing, isRising)
 
         // ── 6. Update state ───────────────────────────────────────
@@ -267,61 +237,6 @@ internal class SimpleTriggerEngine(
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // STEP 1: SIGNAL CONDITIONING
-    // ═══════════════════════════════════════════════════════════════
-
-    private fun ensureBiquadCoeffs(sampleRateHz: Float) {
-        if (cachedSampleRate == sampleRateHz) return
-        cachedSampleRate = sampleRateHz
-
-        // 156 Hz high-shelf, -40 dB, slope 0.7
-        val hs = designHighShelf(sampleRateHz, 156f, 0.7f, -40f)
-        hsB0 = hs[0]; hsB1 = hs[1]; hsB2 = hs[2]; hsA1 = hs[3]; hsA2 = hs[4]
-
-        // 800 Hz 4th-order Butterworth = two cascaded biquads
-        // Butterworth Qs: 0.5412, 1.3066
-        val l1 = designLowPass(sampleRateHz, 800f, 0.5412f)
-        lp1B0 = l1[0]; lp1B1 = l1[1]; lp1B2 = l1[2]; lp1A1 = l1[3]; lp1A2 = l1[4]
-        val l2 = designLowPass(sampleRateHz, 800f, 1.3066f)
-        lp2B0 = l2[0]; lp2B1 = l2[1]; lp2B2 = l2[2]; lp2A1 = l2[3]; lp2A2 = l2[4]
-    }
-
-    /** Two-stage conditioning: 156 Hz high-shelf (-40 dB) → 800 Hz 4th-order lowpass. */
-    private fun applyConditioningFilters(signal: FloatArray, sampleRateHz: Float): FloatArray {
-        ensureBiquadCoeffs(sampleRateHz)
-        val n = signal.size
-        val out = FloatArray(n)
-        // biquad state
-        var hsX1 = 0f;
-        var hsX2 = 0f;
-        var hsY1 = 0f;
-        var hsY2 = 0f
-        var lp1X1 = 0f;
-        var lp1X2 = 0f;
-        var lp1Y1 = 0f;
-        var lp1Y2 = 0f
-        var lp2X1 = 0f;
-        var lp2X2 = 0f;
-        var lp2Y1 = 0f;
-        var lp2Y2 = 0f
-
-        for (i in 0 until n) {
-            // high-shelf
-            val x = signal[i]
-            val yHs = hsB0 * x + hsB1 * hsX1 + hsB2 * hsX2 - hsA1 * hsY1 - hsA2 * hsY2
-            hsX2 = hsX1; hsX1 = x; hsY2 = hsY1; hsY1 = yHs
-            // lowpass stage 1
-            val yL1 = lp1B0 * yHs + lp1B1 * lp1X1 + lp1B2 * lp1X2 - lp1A1 * lp1Y1 - lp1A2 * lp1Y2
-            lp1X2 = lp1X1; lp1X1 = yHs; lp1Y2 = lp1Y1; lp1Y1 = yL1
-            // lowpass stage 2
-            val yL2 = lp2B0 * yL1 + lp2B1 * lp2X1 + lp2B2 * lp2X2 - lp2A1 * lp2Y1 - lp2A2 * lp2Y2
-            lp2X2 = lp2X1; lp2X1 = yL1; lp2Y2 = lp2Y1; lp2Y1 = yL2
-            out[i] = yL2
-        }
-        return out
-    }
-    
-    // ═══════════════════════════════════════════════════════════════
     // STEP 2: ZERO-CROSSING DETECTION (hysteresis + holdoff)
     // ═══════════════════════════════════════════════════════════════
 
@@ -382,41 +297,4 @@ internal class SimpleTriggerEngine(
         return result
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // BIQUAD FILTER DESIGN (RBJ Audio EQ Cookbook)
-    // ═══════════════════════════════════════════════════════════════
-
-    /** Returns [b0, b1, b2, a1, a2] normalised by a0. */
-    private fun designLowPass(sampleRateHz: Float, cutoffHz: Float, q: Float): FloatArray {
-        val w0 = 2f * PI.toFloat() * cutoffHz / sampleRateHz
-        val cosW0 = cos(w0);
-        val sinW0 = sin(w0)
-        val alpha = sinW0 / (2f * q)
-        val b0 = (1f - cosW0) / 2f
-        val b1 = 1f - cosW0
-        val b2 = (1f - cosW0) / 2f
-        val a0 = 1f + alpha
-        val a1 = -2f * cosW0
-        val a2 = 1f - alpha
-        return floatArrayOf(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
-    }
-
-    /** High-shelf with gainDb (negative = cut), slope parameter S. */
-    private fun designHighShelf(sampleRateHz: Float, centerHz: Float, slope: Float, gainDb: Float): FloatArray {
-        val w0 = 2f * PI.toFloat() * centerHz / sampleRateHz
-        val cosW0 = cos(w0);
-        val sinW0 = sin(w0)
-        val a = 10f.pow(gainDb / 40f)
-        val s = slope.coerceIn(0.1f, 2f)
-        val alphaTerm = max((a + 1f / a) * (1f / s - 1f) + 2f, 0f)
-        val alpha = sinW0 / 2f * sqrt(alphaTerm)
-        val twoSqrtAAlpha = 2f * sqrt(a) * alpha
-        val b0 = a * ((a + 1f) - (a - 1f) * cosW0 + twoSqrtAAlpha)
-        val b1 = 2f * a * ((a - 1f) - (a + 1f) * cosW0)
-        val b2 = a * ((a + 1f) - (a - 1f) * cosW0 - twoSqrtAAlpha)
-        val a0 = (a + 1f) + (a - 1f) * cosW0 + twoSqrtAAlpha
-        val a1 = -2f * ((a - 1f) + (a + 1f) * cosW0)
-        val a2 = (a + 1f) + (a - 1f) * cosW0 - twoSqrtAAlpha
-        return floatArrayOf(b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
-    }
 }

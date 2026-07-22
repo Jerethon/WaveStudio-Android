@@ -1384,7 +1384,6 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                     mode = SimpleTriggerEngine.Mode.RISING,
                                     sampleRateHz = sampleRate.toFloat(),
                                     preTriggerRatio = 0.20f,
-                                    sourceMode = SimpleTriggerEngine.SourceMode.OUTPUT,
                                     globalBase = totalSamplesWritten - fillCount,
                                     triggerThreshold = 0.02f,
                                     holdoffMs = 1f,
@@ -1958,7 +1957,6 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                         mode = SimpleTriggerEngine.Mode.RISING,
                                         sampleRateHz = sampleRate.toFloat(),
                                         preTriggerRatio = 0.20f,
-                                        sourceMode = SimpleTriggerEngine.SourceMode.OUTPUT,
                                         globalBase = totalSamplesWritten - fillCount,
                                         triggerThreshold = 0.02f,
                                         holdoffMs = 1f,
@@ -3971,4 +3969,3 @@ private fun rtDesignRCHighPass(sampleRate: Int, cutoffHz: Float): RtBiquad {
         a2 = 0f
     )
 }
-

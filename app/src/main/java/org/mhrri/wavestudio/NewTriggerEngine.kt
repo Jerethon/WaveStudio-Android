@@ -23,8 +23,6 @@ internal class NewTriggerEngine(
         FALLING,
     }
 
-    enum class TriggerSourceMode { OUTPUT, CONDITIONED }
-
     data class Config(
         val mode: Mode,
         val sampleRateHz: Float,
@@ -43,7 +41,6 @@ internal class NewTriggerEngine(
         val unlockAfterBadFrames: Int = 6,
         val periodSmoothAlpha: Float = 0.18f,
         // Extra fields for API compatibility (unused in 0.12.0 core logic)
-        val sourceMode: TriggerSourceMode = TriggerSourceMode.OUTPUT,
         val triggerThreshold: Float = FIXED_TRIGGER_THRESHOLD,
         val triggerCrossingHysteresisFloor: Float = 0.002f,
         val triggerCrossingHysteresisRatio: Float = 0.18f,
@@ -60,9 +57,6 @@ internal class NewTriggerEngine(
         val triggerSearchMaxSamples: Int = 6144,
         val triggerPeriodEstimateMaxSamples: Int = 2048,
         val triggerRenderRefineMaxOffsetSamples: Int = 18,
-        val triggerConditioningHighShelfHz: Float = 156.0f,
-        val triggerConditioningHighShelfGainDb: Float = -40.0f,
-        val triggerConditioningLowPassHz: Float = 800.0f,
         val triggerAssistLowPassCutoffHz: Float = 360.0f,
         val triggerAssistLowPassOrder: Int = 3,
     )
