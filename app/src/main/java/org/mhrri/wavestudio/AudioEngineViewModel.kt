@@ -1129,7 +1129,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 var lastPublishedAlive = false
                 var lastLogAt = 0L
                 var lastUiUpdateAt = 0L
-                // Trigger processing: now runs inline with UI publish, no independent cadence needed
+                // Trigger processing: runs inline with UI publish, no independent cadence needed
                 var lastGoodTriggerMs = 0L
                 // Fixed ring buffer read position for trigger engine. By always reading from
                 // the same position, the engine sees the same physical samples every frame,
@@ -1729,7 +1729,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                 var ringSize = 0
                 var totalSamplesWritten = 0L
                 var lastUiUpdateAt = 0L
-                // Trigger processing: now runs inline with UI publish, no independent cadence needed
+                // Trigger processing: runs inline with UI publish, no independent cadence needed
                 var lastGoodTriggerMs = 0L
 
                 val chunkSize = inBlock.size
