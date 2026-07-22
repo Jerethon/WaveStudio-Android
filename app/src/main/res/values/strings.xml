@@ -175,7 +175,7 @@
     <string name="preset_help_text">预设是 .json 文件。先点“导出”保存到手机；如果要发给别人，也可以不导出直接点“分享”。对方收到后点“导入”选择该文件即可。</string>
 
     <string name="about_contributors">参与开发人员（B站名）：02B4806長-02001、某地铁迷_、莓喵の小风扇、TEP-28WG01等</string>
-    <string name="about_qq_group">磁拾音器QQ交流群：762852552</string>
+    <string name="about_qq_group">磁拾音器QQ交流群：1038938321</string>
     <string name="about_official_website_label">磁拾音器研究所官网：</string>
     <string name="about_preset_download_placeholder">预设配置下载：（暂时预留）</string>
 
@@ -196,10 +196,11 @@
     <string name="about_website_button">组织官网</string>
     <string name="about_contributors_title">开发名单</string>
     <string name="about_preset_download_unavailable">预设下载功能暂未开放</string>
-    <string name="about_community_button">社区</string>
-    <string name="about_community_title">社区</string>
+    <string name="about_community_button">交流群</string>
+    <string name="about_community_title">交流群</string>
     <string name="about_qq_group_label">QQ交流群</string>
-    <string name="about_qq_group_number">762852552</string>
+    <string name="about_qq_group_number">1038938321</string>
+    <string name="about_qq_copy_hint">（点击复制）</string>
     <string name="about_discord_server_label">Discord服务器</string>
     <string name="about_discord_server_invite_link">https://discord.gg/nduVkGtSbP</string>
     <string name="about_copied_toast">已复制到剪贴板</string>
@@ -225,6 +226,7 @@
     </string-array>
 
     <string-array name="about_dev_past_contributors_members">
+        <item>磁拾音器研究所（开发组织）</item>
         <item>TEP-28WG01（开发、图标设计）</item>
         <item>PulsMeister（英语校对）</item>
         <item>TriumphantCreator（英语校对）</item>

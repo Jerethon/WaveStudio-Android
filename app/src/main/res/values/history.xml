@@ -3,6 +3,10 @@
     <!-- About changelog -->
     <string name="about_changelog_version_title">%1$s 版本主要更新内容：</string>
 
+    <string-array name="about_changelog_v0170">
+        <item>重构关于菜单</item>
+        <item>大幅优化 Trigger 功能</item>
+    </string-array>
     <string-array name="about_changelog_v0161">
         <item>重构关于菜单</item>
         <item>优化项目代码</item>

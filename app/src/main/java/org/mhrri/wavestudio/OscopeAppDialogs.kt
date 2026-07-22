@@ -718,7 +718,6 @@ internal fun AboutDialog(
     } catch (_: Exception) {
         ""
     }
-    val aboutByline = stringResource(R.string.about_byline)
     val aboutHint = stringResource(R.string.about_hint)
     val aboutWebsiteUrl = stringResource(R.string.about_website_url_new)
     // Pre-compute strings needed in non-Composable onClick lambdas
@@ -726,6 +725,7 @@ internal fun AboutDialog(
     val websiteRedirectMsg = stringResource(R.string.about_website_redirect_confirm, aboutWebsiteUrl)
 
     val aboutSections = listOf(
+        "0.17.0" to R.array.about_changelog_v0170,
         "0.16.1" to R.array.about_changelog_v0161,
         "0.16.0" to R.array.about_changelog_v0160,
         "0.15.3.1" to R.array.about_changelog_v01531,
@@ -795,7 +795,7 @@ internal fun AboutDialog(
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp),
             ) {
                 // 1. App icon + name + version
                 Row(
@@ -818,7 +818,7 @@ internal fun AboutDialog(
                             ),
                             contentDescription = null,
                             modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.FillBounds,
+                            contentScale = ContentScale.Fit,
                         )
                     }
                     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -834,14 +834,10 @@ internal fun AboutDialog(
                     }
                 }
 
-                // 2. Development organization
-                Text(
-                    text = "${stringResource(R.string.about_development_org_label)}: $aboutByline",
-                    style = MaterialTheme.typography.bodyMedium,
+                // 3. Separator (with vertical margin)
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 8.dp),
                 )
-
-                // 3. Separator
-                HorizontalDivider()
 
                 // 4. Usage tips (prominent red warning)
                 Text(
@@ -855,26 +851,7 @@ internal fun AboutDialog(
                     color = Color.Red,
                 )
 
-                // 5. Bottom buttons – Row 1: 预设配置下载 (full width)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            Toast.makeText(context, presetUnavailableMsg, Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier.fillMaxWidth(0.7f),
-                    ) {
-                        Text(
-                            text = stringResource(R.string.about_preset_download_button),
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                        )
-                    }
-                }
-
-                // 6. Bottom buttons – Row 2: 更新日志 | 开发人员名单
+                // 5. Bottom buttons – Row 1: 更新日志 | 开发人员名单
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -900,28 +877,27 @@ internal fun AboutDialog(
                         )
                     }
                 }
-
-                // 7. Bottom buttons – Row 3: 组织官网链接 | 社区
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    OutlinedButton(
-                        onClick = { showWebsiteConfirm = true },
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(
-                            text = stringResource(R.string.about_website_button),
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1,
-                        )
-                    }
                     OutlinedButton(
                         onClick = { showCommunityDialog = true },
                         modifier = Modifier.weight(1f),
                     ) {
                         Text(
                             text = stringResource(R.string.about_community_button),
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { },
+                        modifier = Modifier.weight(1f),
+                        enabled = false,
+                    ) {
+                        Text(
+                            text = stringResource(R.string.about_preset_download_button),
                             style = MaterialTheme.typography.labelMedium,
                             maxLines = 1,
                         )
@@ -954,7 +930,6 @@ internal fun AboutDialog(
     if (showCommunityDialog) {
         CommunityDialog(
             qqGroupNumber = stringResource(R.string.about_qq_group_number),
-            discordInvite = stringResource(R.string.about_discord_server_invite_link),
             onDismiss = { showCommunityDialog = false },
         )
     }
@@ -1063,17 +1038,23 @@ private fun ChangelogFullScreenDialog(
                                 .padding(horizontal = 16.dp, vertical = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            aboutSections.forEach { section ->
+                            aboutSections.forEachIndexed { idx, section ->
                                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                     Text(
                                         text = section.title,
                                         style = MaterialTheme.typography.titleSmall,
                                         fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        color = MaterialTheme.colorScheme.primary,
                                     )
                                     section.bullets.forEach { bullet ->
-                                        AboutBullet(bullet)
+                                        AboutBullet(bullet, bulletColor = MaterialTheme.colorScheme.primary)
                                     }
+                                }
+                                if (idx < aboutSections.lastIndex) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(vertical = 4.dp),
+                                        thickness = 0.5.dp,
+                                    )
                                 }
                             }
                             Spacer(Modifier.height(32.dp))
@@ -1186,13 +1167,11 @@ private fun ContributorsFullScreenDialog(
 @Composable
 private fun CommunityDialog(
     qqGroupNumber: String,
-    discordInvite: String,
     onDismiss: () -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val copiedToast = stringResource(R.string.about_copied_toast)
     val qqLabel = stringResource(R.string.about_qq_group_label)
-    val discordLabel = stringResource(R.string.about_discord_server_label)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1214,33 +1193,21 @@ private fun CommunityDialog(
                     },
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Text(
-                        text = qqGroupNumber,
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
-
-                HorizontalDivider()
-
-                // Discord section
-                Text(
-                    text = discordLabel,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                OutlinedButton(
-                    onClick = {
-                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        val clip = ClipData.newPlainText(discordLabel, discordInvite)
-                        clipboard.setPrimaryClip(clip)
-                        Toast.makeText(context, copiedToast, Toast.LENGTH_SHORT).show()
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(
-                        text = discordInvite,
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = qqGroupNumber,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            text = stringResource(R.string.about_qq_copy_hint),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
                 }
             }
         },
@@ -1253,16 +1220,16 @@ private fun CommunityDialog(
 }
 
 @Composable
-private fun AboutBullet(text: String, color: Color = MaterialTheme.colorScheme.onSurfaceVariant) {
+private fun AboutBullet(text: String, color: Color = MaterialTheme.colorScheme.onSurfaceVariant, bulletColor: Color = MaterialTheme.colorScheme.primary) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Text(
-            text = "•",
+            text = "–",
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.primary,
+            color = bulletColor,
         )
         Text(
             text = text,

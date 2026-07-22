@@ -3,6 +3,10 @@
     <!-- About changelog -->
     <string name="about_changelog_version_title">Key updates in version %1$s:</string>
 
+    <string-array name="about_changelog_v0170">
+        <item>Refactored the About menu</item>
+        <item>Optimized Trigger functionality</item>
+    </string-array>
     <string-array name="about_changelog_v0161">
         <item>Refactored the About menu</item>
         <item>Optimized project code</item>

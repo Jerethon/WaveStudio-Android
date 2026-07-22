@@ -187,7 +187,7 @@
     <string name="preset_help_text">Presets are .json files. Tap "Export" to save to your phone; if you want to send one to others, you can tap "Share" directly without exporting. After receiving it, tap "Import" and choose that file.</string>
 
     <string name="about_contributors">Contributors (Bilibili): 02B4806長-02001, 某地铁迷_, 莓喵の小风扇, TEP-28WG01, etc.</string>
-    <string name="about_qq_group">MoHa-Radio QQ Group: 762852552</string>
+    <string name="about_qq_group">MoHa-Radio QQ Group: 1038938321</string>
     <string name="about_official_website_label">Official website:</string>
     <string name="about_preset_download_placeholder">Preset download: (reserved)</string>
 
@@ -208,10 +208,11 @@
     <string name="about_website_button">Website</string>
     <string name="about_contributors_title">Dev Team</string>
     <string name="about_preset_download_unavailable">Preset download feature is not available yet</string>
-    <string name="about_community_button">Community</string>
-    <string name="about_community_title">Community</string>
+    <string name="about_community_button">Chat group</string>
+    <string name="about_community_title">Chat group</string>
     <string name="about_qq_group_label">QQ Group</string>
-    <string name="about_qq_group_number">762852552</string>
+    <string name="about_qq_group_number">1038938321</string>
+    <string name="about_qq_copy_hint">(Click to copy)</string>
     <string name="about_discord_server_label">Discord Server</string>
     <string name="about_discord_server_invite_link">https://discord.gg/nduVkGtSbP</string>
     <string name="about_copied_toast">Copied to clipboard</string>
@@ -237,6 +238,7 @@
     </string-array>
 
     <string-array name="about_dev_past_contributors_members">
+        <item>MoHa-Radio Research Institute (Development Organization)</item>
         <item>TEP-28WG01 (Development, Icon Design)</item>
         <item>PulsMeister (English Proofreading)</item>
         <item>TriumphantCreator (English Proofreading)</item>
