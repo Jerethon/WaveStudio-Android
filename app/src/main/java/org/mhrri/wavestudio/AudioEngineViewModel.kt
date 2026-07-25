@@ -387,9 +387,9 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     private val _highPassEnabled = MutableStateFlow(false)
     val highPassEnabled: StateFlow<Boolean> = _highPassEnabled.asStateFlow()
 
-    private val _highPassCutoff = MutableStateFlow(30f)
+    private val _highPassCutoff = MutableStateFlow(20f)
     val highPassCutoff: StateFlow<Float> = _highPassCutoff.asStateFlow()
-    private val _highPassStageCutoffs = MutableStateFlow(List(8) { 30f })
+    private val _highPassStageCutoffs = MutableStateFlow(List(8) { 20f })
     val highPassStageCutoffs: StateFlow<List<Float>> = _highPassStageCutoffs.asStateFlow()
 
     // Global 1Hz high-pass setting (exposed in settings)
@@ -3580,8 +3580,8 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         _lowPassOrder.value = 1
 
         _highPassEnabled.value = false
-        _highPassCutoff.value = 50f
-        _highPassStageCutoffs.value = List(8) { 50f }
+        _highPassCutoff.value = 20f
+        _highPassStageCutoffs.value = List(8) { 20f }
         _highPassOrder.value = 1
 
         _filterGain.value = 1f

@@ -12,7 +12,6 @@ class SimpleTriggerEngineTest {
     private val frequencyHz = 440f
     private val frameSize = 2_400
     private val displaySize = 512
-    private val expectedDisplayEdge = (displaySize * 0.20f).toInt()
 
     @Test
     fun acquisitionPlacesRisingEdgeNearDisplayReference() {
@@ -61,6 +60,74 @@ class SimpleTriggerEngineTest {
         }
     }
 
+    @Test
+    fun lowFrequencyPhaseLockRemainsStableAcrossRefreshRates() {
+        for (frequency in listOf(20f, 30f, 40f, 50f)) {
+            for (refreshHz in listOf(20, 30, 60)) {
+                val engine = SimpleTriggerEngine()
+                val samplesPerFrame = (sampleRate / refreshHz).roundToInt()
+                repeat(16) { frame ->
+                    val globalBase = frame.toLong() * samplesPerFrame
+                    val source = sineFrame(globalBase, frequency, size = 4_800)
+                    val result = engine.process(
+                        source,
+                        config(globalBase).copy(displayWindowSamples = 2_400),
+                    )
+
+                    assertTrue(
+                        "frequency=$frequency refresh=$refreshHz frame=$frame did not lock",
+                        result.locked,
+                    )
+                    assertTrue(
+                        "expected=$frequency actual=${result.freqHz} period=${result.periodSamples}",
+                        abs(result.freqHz - frequency) <= maxOf(2f, frequency * 0.08f),
+                    )
+                    assertEdgeAtDisplayReference(
+                        source = source,
+                        result = result,
+                        displayWindowSize = 2_400,
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun lowFrequencySpwmDoesNotJumpBetweenCarrierEdges() {
+        for (frequency in listOf(20f, 30f, 40f, 50f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val fundamentalPeriod = (sampleRate / frequency).roundToInt()
+            val phases = ArrayList<Int>()
+            val estimatedPeriods = ArrayList<Int>()
+
+            repeat(24) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val source = spwmLineFrame(globalBase, frequency, size = 4_800)
+                val result = engine.process(
+                    source,
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 4) {
+                    phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
+                    estimatedPeriods += result.periodSamples
+                }
+            }
+
+            val reference = phases.first()
+            val maxPhaseJump = phases.maxOf { phase ->
+                val direct = abs(phase - reference)
+                minOf(direct, fundamentalPeriod - direct)
+            }
+            assertTrue(
+                "frequency=$frequency max phase jump=$maxPhaseJump samples, " +
+                    "phases=$phases, estimatedPeriods=$estimatedPeriods",
+                maxPhaseJump <= (sampleRate * 0.001f).roundToInt(),
+            )
+        }
+    }
+
     private fun config(globalBase: Long) = SimpleTriggerEngine.Config(
         mode = SimpleTriggerEngine.Mode.RISING,
         sampleRateHz = sampleRate,
@@ -68,21 +135,46 @@ class SimpleTriggerEngineTest {
         triggerThreshold = 0.02f,
     )
 
-    private fun sineFrame(globalBase: Long): FloatArray = FloatArray(frameSize) { index ->
-        sin(2.0 * PI * frequencyHz * (globalBase + index) / sampleRate).toFloat()
+    private fun sineFrame(
+        globalBase: Long,
+        frequency: Float = frequencyHz,
+        size: Int = frameSize,
+    ): FloatArray = FloatArray(size) { index ->
+        sin(2.0 * PI * frequency * (globalBase + index) / sampleRate).toFloat()
+    }
+
+    private fun spwmLineFrame(
+        globalBase: Long,
+        frequency: Float,
+        size: Int,
+    ): FloatArray = FloatArray(size) { index ->
+        val sample = globalBase + index
+        val fundamentalPhase = 2.0 * PI * frequency * sample / sampleRate
+        val carrierPhase = ((sample * frequency * 18.0 / sampleRate) % 1.0 + 1.0) % 1.0
+        val carrier = 4.0 * abs(carrierPhase - 0.5) - 1.0
+        val u = if (0.55 * sin(fundamentalPhase) > carrier) 1f else 0f
+        val v = if (0.55 * sin(fundamentalPhase - 2.0 * PI / 3.0) > carrier) 1f else 0f
+        u - v
+    }
+
+    private fun floorMod(value: Long, modulus: Int): Int {
+        val result = (value % modulus).toInt()
+        return if (result >= 0) result else result + modulus
     }
 
     private fun assertEdgeAtDisplayReference(
         source: FloatArray,
         result: SimpleTriggerEngine.Result,
+        displayWindowSize: Int = displaySize,
     ) {
-        val window = SimpleTriggerEngine().extractWindow(source, result, displaySize, 0.20f)
+        val expectedEdge = (displayWindowSize * 0.20f).toInt()
+        val window = SimpleTriggerEngine().extractWindow(source, result, displayWindowSize, 0.20f)
         val nearestRisingEdge = (1 until window.size)
             .filter { window[it - 1] < 0f && window[it] >= 0f }
-            .minByOrNull { abs(it - expectedDisplayEdge) }
+            .minByOrNull { abs(it - expectedEdge) }
         assertTrue(
             "display edge=$nearestRisingEdge, trigger=${result.anchorIndex}",
-            nearestRisingEdge != null && abs(nearestRisingEdge - expectedDisplayEdge) <= 4,
+            nearestRisingEdge != null && abs(nearestRisingEdge - expectedEdge) <= 4,
         )
     }
 }
