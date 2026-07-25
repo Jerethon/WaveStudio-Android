@@ -103,13 +103,26 @@ fun toEnglishOrdinal(value: Int): String {
 
 // Compute the EQ combined response (in dB) for a list of bands at given freqs.
 // Uses RBJ Peaking EQ design (same math as in the audio engine) so the UI graph matches actual filter effect.
-fun computeEqResponse(bands: List<AudioEngineViewModel.EqBand>, freqs: FloatArray, lowPassEnabled: Boolean, lowPassCutoff: Float, highPassEnabled: Boolean, highPassCutoff: Float, filterGain: Float, sampleRate: Int): FloatArray {
+fun computeEqResponse(
+    bands: List<AudioEngineViewModel.EqBand>,
+    freqs: FloatArray,
+    lowPassEnabled: Boolean,
+    lowPassCutoff: Float,
+    lowPassStageCutoffs: List<Float>,
+    lowPassOrder: Int,
+    highPassEnabled: Boolean,
+    highPassCutoff: Float,
+    highPassStageCutoffs: List<Float>,
+    highPassOrder: Int,
+    filterGain: Float,
+    sampleRate: Int,
+): FloatArray {
     val out = FloatArray(freqs.size) { 0f }
 
     // Precompute enabled biquad coefficients for each band (PEAK/LOW_SHELF/HIGH_SHELF)
     data class Coef(val b0: Float, val b1: Float, val b2: Float, val a1: Float, val a2: Float)
     val coefs = bands.filter { it.enabled }
-        .map { b ->
+        .mapTo(mutableListOf()) { b ->
             val centerHz = b.freqHz.coerceAtLeast(1f)
             val gainDb = b.gainDb.coerceIn(-60f, 60f) // clamp wide just for computation
             val qOrSlope = AudioEngineViewModel.clampEqQForBand(b.type, gainDb, b.q)
@@ -171,6 +184,28 @@ fun computeEqResponse(bands: List<AudioEngineViewModel.EqBand>, freqs: FloatArra
             Coef(b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0)
         }
 
+    val nyquist = sampleRate / 2f - 1f
+    if (lowPassEnabled) {
+        repeat(lowPassOrder.coerceIn(1, 8)) { stage ->
+            val cutoff = lowPassStageCutoffs.getOrElse(stage) { lowPassCutoff }
+                .coerceIn(5f, nyquist)
+            val dt = 1f / sampleRate
+            val rc = 1f / (2f * PI.toFloat() * cutoff)
+            val alpha = (dt / (rc + dt)).coerceIn(0f, 1f)
+            coefs += Coef(alpha, 0f, 0f, alpha - 1f, 0f)
+        }
+    }
+    if (highPassEnabled) {
+        repeat(highPassOrder.coerceIn(1, 8)) { stage ->
+            val cutoff = highPassStageCutoffs.getOrElse(stage) { highPassCutoff }
+                .coerceIn(5f, nyquist)
+            val dt = 1f / sampleRate
+            val rc = 1f / (2f * PI.toFloat() * cutoff)
+            val alpha = (rc / (rc + dt)).coerceIn(0f, 1f)
+            coefs += Coef(alpha, -alpha, 0f, -alpha, 0f)
+        }
+    }
+
     for (i in freqs.indices) {
         val f = freqs[i]
         val w = 2f * PI.toFloat() * f / sampleRate.toFloat()
@@ -196,9 +231,9 @@ fun computeEqResponse(bands: List<AudioEngineViewModel.EqBand>, freqs: FloatArra
 
         val mag = sqrt(magSquared.toDouble()).toFloat().coerceAtLeast(1e-12f)
         val db = 20f * log10(mag)
-        out[i] = db.coerceIn(-120f, 120f)
+        val gainDb = 20f * log10(filterGain.coerceAtLeast(1e-6f))
+        out[i] = (db + gainDb).coerceIn(-120f, 120f)
     }
 
     return out
 }
-

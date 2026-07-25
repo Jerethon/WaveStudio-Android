@@ -2,6 +2,7 @@ package org.mhrri.wavestudio
 
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -42,6 +43,24 @@ class SimpleTriggerEngineTest {
         assertTrue(abs(second.periodSamples - third.periodSamples) <= 3)
     }
 
+    @Test
+    fun phaseLockIsIndependentOfDisplayRefreshRate() {
+        for (refreshHz in listOf(10, 20, 30, 60)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / refreshHz).roundToInt()
+            repeat(12) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val result = engine.process(
+                    sineFrame(globalBase),
+                    config(globalBase),
+                )
+
+                assertTrue("refresh=$refreshHz frame=$frame did not lock", result.locked)
+                assertEdgeAtDisplayReference(sineFrame(globalBase), result)
+            }
+        }
+    }
+
     private fun config(globalBase: Long) = SimpleTriggerEngine.Config(
         mode = SimpleTriggerEngine.Mode.RISING,
         sampleRateHz = sampleRate,
@@ -67,5 +86,3 @@ class SimpleTriggerEngineTest {
         )
     }
 }
-
-

@@ -437,9 +437,9 @@ fun OscopeApp(
     }
 
     fun snapHighPassHz(hz: Float): Float {
-        val v = hz.coerceIn(30f, 8001f)
+        val v = hz.coerceIn(20f, 10000f)
         val step = cutoffStepHighPass(v)
-        return (round(v / step) * step).coerceIn(30f, 8001f)
+        return (round(v / step) * step).coerceIn(20f, 10000f)
     }
 
     fun formatLowPassHz(hz: Float): String {
@@ -552,8 +552,10 @@ fun OscopeApp(
 
     val lowPassEnabled by audioViewModel.lowPassEnabled.collectAsStateWithLifecycle()
     val lowPassCutoff by audioViewModel.lowPassCutoff.collectAsStateWithLifecycle()
+    val lowPassStageCutoffs by audioViewModel.lowPassStageCutoffs.collectAsStateWithLifecycle()
     val highPassEnabled by audioViewModel.highPassEnabled.collectAsStateWithLifecycle()
     val highPassCutoff by audioViewModel.highPassCutoff.collectAsStateWithLifecycle()
+    val highPassStageCutoffs by audioViewModel.highPassStageCutoffs.collectAsStateWithLifecycle()
     val globalHighPassEnabled by audioViewModel.globalHighPassEnabled.collectAsStateWithLifecycle()
     val globalHighPassCutoff by audioViewModel.globalHighPassCutoff.collectAsStateWithLifecycle()
 
@@ -657,8 +659,8 @@ fun OscopeApp(
     // ===== 频率滑块：拖动时用本地 0..1 状态避免“映射回写”造成手指/滑块不贴合 =====
     val lowPassMin = 800f
     val lowPassMax = 30001f
-    val highPassMin = 30f
-    val highPassMax = 8001f
+    val highPassMin = 20f
+    val highPassMax = 10000f
     val lowPassLinearW = 0.5f
 
     // 明确类型，避免 Kotlin 推断失败
@@ -1170,7 +1172,7 @@ fun OscopeApp(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Height control (70..130, step 10)
+                // Height control
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
                         onClick = { rawWaveHeightDp = decWaveHeight(rawWaveHeightDp) },
@@ -1270,7 +1272,7 @@ fun OscopeApp(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Height control (70..130, step 10)
+                // Height control
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
                         onClick = { filteredWaveHeightDp = decWaveHeight(filteredWaveHeightDp) },
@@ -1410,8 +1412,10 @@ fun OscopeApp(
                 recentlyDeletedRecordings = recentlyDeletedRecordings,
                 lowPassEnabled = lowPassEnabled,
                 lowPassCutoff = lowPassCutoff,
+                lowPassStageCutoffs = lowPassStageCutoffs,
                 highPassEnabled = highPassEnabled,
                 highPassCutoff = highPassCutoff,
+                highPassStageCutoffs = highPassStageCutoffs,
                 lowPassOrder = lowPassOrder,
                 highPassOrder = highPassOrder,
                 windowMs = windowMs,
@@ -1463,6 +1467,12 @@ fun OscopeApp(
                 onToggleHighPass = { audioViewModel.toggleHighPass(it) },
                 onSetLowPassOrder = { audioViewModel.setLowPassOrder(it) },
                 onSetHighPassOrder = { audioViewModel.setHighPassOrder(it) },
+                onSetLowPassStageCutoff = { stage, cutoff ->
+                    audioViewModel.updateLowPassStageCutoff(stage, cutoff)
+                },
+                onSetHighPassStageCutoff = { stage, cutoff ->
+                    audioViewModel.updateHighPassStageCutoff(stage, cutoff)
+                },
                 onUpdateFilterGain = { audioViewModel.updateFilterGain(it) },
                 onUpdateTimeSlider = { audioViewModel.updateTimeSlider(it) },
                 onSetEqEnabled = { audioViewModel.setEqEnabled(it) },

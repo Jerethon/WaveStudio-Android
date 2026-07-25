@@ -167,6 +167,8 @@
     <!-- EQ -->
     <string name="filter_order_format">Order %1$d</string>
     <string name="filter_order_ordinal_format">%1$s Order</string>
+    <string name="filter_stage_cutoff_value">Stage %1$d cutoff %2$s Hz</string>
+    <string name="filter_stage_cutoff_set_title">Set stage %1$d cutoff</string>
     <string name="eq_panel_title">Graphic EQ</string>
     <string name="eq_reset_all">Reset EQ</string>
     <string name="eq_band_freq_value">Band %1$s Freq %2$s Hz</string>

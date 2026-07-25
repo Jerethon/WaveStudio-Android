@@ -155,6 +155,8 @@
 
     <string name="filter_order_format">%1$d 阶</string>
     <string name="filter_order_ordinal_format">%1$s 阶</string>
+    <string name="filter_stage_cutoff_value">第 %1$d 级截止 %2$s Hz</string>
+    <string name="filter_stage_cutoff_set_title">设置第 %1$d 级截止频率</string>
     <string name="eq_panel_title">图形均衡器</string>
     <string name="eq_reset_all">重置均衡器</string>
     <string name="eq_band_freq_value">第 %1$s 段 频率 %2$s Hz</string>

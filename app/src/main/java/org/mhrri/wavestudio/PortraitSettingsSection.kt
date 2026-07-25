@@ -104,8 +104,10 @@ internal data class PortraitSettingsState(
     val recentlyDeletedRecordings: List<RecordedClip>,
     val lowPassEnabled: Boolean,
     val lowPassCutoff: Float,
+    val lowPassStageCutoffs: List<Float>,
     val highPassEnabled: Boolean,
     val highPassCutoff: Float,
+    val highPassStageCutoffs: List<Float>,
     val lowPassOrder: Int,
     val highPassOrder: Int,
     val windowMs: Float,
@@ -127,6 +129,8 @@ internal data class PortraitSettingsActions(
     val onToggleHighPass: (Boolean) -> Unit,
     val onSetLowPassOrder: (Int) -> Unit,
     val onSetHighPassOrder: (Int) -> Unit,
+    val onSetLowPassStageCutoff: (Int, Float) -> Unit,
+    val onSetHighPassStageCutoff: (Int, Float) -> Unit,
     val onUpdateFilterGain: (Float) -> Unit,
     val onUpdateTimeSlider: (Float) -> Unit,
     val onSetEqEnabled: (Boolean) -> Unit,
@@ -261,9 +265,9 @@ private fun snapLowPassHz(hz: Float): Float {
 }
 
 private fun snapHighPassHz(hz: Float): Float {
-    val v = hz.coerceIn(30f, 8001f)
+    val v = hz.coerceIn(20f, 10000f)
     val step = cutoffStepHighPass(v)
-    return (round(v / step) * step).coerceIn(30f, 8001f)
+    return (round(v / step) * step).coerceIn(20f, 10000f)
 }
 
 private fun formatLowPassHz(hz: Float): String = snapLowPassHz(hz).toInt().toString()
@@ -280,6 +284,66 @@ private fun gainToDb(gain: Float): Float {
 
 private fun dbToGain(db: Float): Float {
     return exp((db / 20f) * ln(10f))
+}
+
+@Composable
+private fun FilterStageCutoffControl(
+    stageIndex: Int,
+    cutoffHz: Float,
+    toSlider: (Float) -> Float,
+    fromSlider: (Float) -> Float,
+    snap: (Float) -> Float,
+    format: (Float) -> String,
+    onCutoffChange: (Float) -> Unit,
+) {
+    var sliderValue by remember(stageIndex) { mutableStateOf(toSlider(cutoffHz)) }
+    var dragging by remember(stageIndex) { mutableStateOf(false) }
+
+    LaunchedEffect(cutoffHz) {
+        if (!dragging) sliderValue = toSlider(cutoffHz)
+    }
+
+    val displayedHz = if (dragging) snap(fromSlider(sliderValue)) else cutoffHz
+    Column(
+        modifier = Modifier.padding(top = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        ClickToEditNumberText(
+            text = stringResource(
+                R.string.filter_stage_cutoff_value,
+                stageIndex + 1,
+                format(displayedHz),
+            ),
+            initialText = format(cutoffHz),
+            title = stringResource(R.string.filter_stage_cutoff_set_title, stageIndex + 1),
+            unit = "Hz",
+            parseAndClamp = { text ->
+                text.trim().replace(",", ".").toFloatOrNull()?.let(snap)
+            },
+            onValue = { value ->
+                dragging = false
+                val snapped = snap(value)
+                sliderValue = toSlider(snapped)
+                onCutoffChange(snapped)
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            contentPadding = PaddingValues(0.dp),
+        )
+        LowHighPassRow(
+            freq01 = sliderValue,
+            onFreq01Change = { value ->
+                dragging = true
+                sliderValue = value
+                onCutoffChange(snap(fromSlider(value)))
+            },
+            onFreq01ChangeFinished = {
+                dragging = false
+                val snapped = snap(fromSlider(sliderValue))
+                sliderValue = toSlider(snapped)
+                onCutoffChange(snapped)
+            },
+        )
+    }
 }
 
 @Composable
@@ -307,7 +371,7 @@ internal fun PortraitSettingsSection(
     var testSignalMenu by remember { mutableStateOf(false) }
 
     var lpFreq01 by remember { mutableStateOf(hzToSliderBlend(state.lowPassCutoff, 600f, 30001f, linearWeight = 0.5f)) }
-    var hpFreq01 by remember { mutableStateOf(hzToSlider(state.highPassCutoff, 30f, 8001f)) }
+    var hpFreq01 by remember { mutableStateOf(hzToSlider(state.highPassCutoff, 20f, 10000f)) }
     var lpDragging by remember { mutableStateOf(false) }
     var hpDragging by remember { mutableStateOf(false) }
 
@@ -323,7 +387,7 @@ internal fun PortraitSettingsSection(
     )
 
     val highPassDisplayHzTarget = if (hpDragging)
-        sliderToHz(hpFreq01, 30f, 8001f)
+        sliderToHz(hpFreq01, 20f, 10000f)
     else state.highPassCutoff
     val highPassDisplayHz = rememberDisplayLowPass(
         target = highPassDisplayHzTarget,
@@ -336,7 +400,7 @@ internal fun PortraitSettingsSection(
         if (!lpDragging) lpFreq01 = hzToSliderBlend(state.lowPassCutoff, 600f, 30001f, linearWeight = 0.5f)
     }
     LaunchedEffect(state.highPassCutoff) {
-        if (!hpDragging) hpFreq01 = hzToSlider(state.highPassCutoff, 30f, 8001f)
+        if (!hpDragging) hpFreq01 = hzToSlider(state.highPassCutoff, 20f, 10000f)
     }
 
     // 拖动时实时影响滤波，效果会立即体现在波形上，而不是等松手。
@@ -350,7 +414,7 @@ internal fun PortraitSettingsSection(
     LaunchedEffect(hpDragging, hpFreq01) {
         if (!hpDragging) return@LaunchedEffect
         kotlinx.coroutines.delay(8)
-        audioViewModel.updateHighPassSlider(snapHighPassHz(sliderToHz(hpFreq01, 30f, 8001f)))
+        audioViewModel.updateHighPassSlider(snapHighPassHz(sliderToHz(hpFreq01, 20f, 10000f)))
     }
 
     val importPresetLauncher = rememberLauncherForActivityResult(
@@ -589,6 +653,25 @@ internal fun PortraitSettingsSection(
                 audioViewModel.updateLowPassSlider(snapLowPassHz(sliderToHzBlend(lpFreq01, 600f, 30001f, linearWeight = 0.5f)))
             },
         )
+        for (stageIndex in 1 until state.lowPassOrder) {
+            FilterStageCutoffControl(
+                stageIndex = stageIndex,
+                cutoffHz = state.lowPassStageCutoffs.getOrElse(stageIndex) {
+                    state.lowPassStageCutoffs.lastOrNull() ?: state.lowPassCutoff
+                },
+                toSlider = {
+                    hzToSliderBlend(it, 600f, 30001f, linearWeight = 0.5f)
+                },
+                fromSlider = {
+                    sliderToHzBlend(it, 600f, 30001f, linearWeight = 0.5f)
+                },
+                snap = ::snapLowPassHz,
+                format = ::formatLowPassHz,
+                onCutoffChange = {
+                    actions.onSetLowPassStageCutoff(stageIndex, it)
+                },
+            )
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -610,7 +693,7 @@ internal fun PortraitSettingsSection(
                         hpDragging = false
                         val snapped = snapHighPassHz(hz)
                         audioViewModel.updateHighPassSlider(snapped)
-                        hpFreq01 = hzToSlider(snapped, 30f, 8001f)
+                        hpFreq01 = hzToSlider(snapped, 20f, 10000f)
                     },
                     style = MaterialTheme.typography.bodyLarge,
                 contentPadding = PaddingValues(0.dp),
@@ -642,9 +725,24 @@ internal fun PortraitSettingsSection(
             },
             onFreq01ChangeFinished = {
                 hpDragging = false
-                audioViewModel.updateHighPassSlider(snapHighPassHz(sliderToHz(hpFreq01, 30f, 8001f)))
+                audioViewModel.updateHighPassSlider(snapHighPassHz(sliderToHz(hpFreq01, 20f, 10000f)))
             },
         )
+        for (stageIndex in 1 until state.highPassOrder) {
+            FilterStageCutoffControl(
+                stageIndex = stageIndex,
+                cutoffHz = state.highPassStageCutoffs.getOrElse(stageIndex) {
+                    state.highPassStageCutoffs.lastOrNull() ?: state.highPassCutoff
+                },
+                toSlider = { hzToSlider(it, 20f, 10000f) },
+                fromSlider = { sliderToHz(it, 20f, 10000f) },
+                snap = ::snapHighPassHz,
+                format = ::formatHighPassHz,
+                onCutoffChange = {
+                    actions.onSetHighPassStageCutoff(stageIndex, it)
+                },
+            )
+        }
 
         EqPanel(
             enabled = state.eqEnabled,
@@ -663,9 +761,11 @@ internal fun PortraitSettingsSection(
             filterGain = state.filterGain,
             lowPassEnabled = state.lowPassEnabled,
             lowPassCutoff = state.lowPassCutoff,
+            lowPassStageCutoffs = state.lowPassStageCutoffs,
             lowPassOrder = state.lowPassOrder,
             highPassEnabled = state.highPassEnabled,
             highPassCutoff = state.highPassCutoff,
+            highPassStageCutoffs = state.highPassStageCutoffs,
             highPassOrder = state.highPassOrder,
             sampleRate = 44100,
         )
@@ -953,11 +1053,6 @@ internal fun PortraitSettingsSection(
         // custom recording storage moved to the compact settings menu (see OscopeApp)
     }
 }
-
-
-
-
-
 
 
 

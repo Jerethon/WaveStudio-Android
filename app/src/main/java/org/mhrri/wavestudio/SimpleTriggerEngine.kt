@@ -1,15 +1,22 @@
 package org.mhrri.wavestudio
 
-import kotlin.math.*
+import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
- * Trigger engine — stabilises repetitive waveforms on screen.
+ * Stateful waveform trigger inspired by CorrScope's correlation trigger.
  *
- * 4-step pipeline (driven at ~30 FPS):
- * 1. Zero-crossing: dual-threshold hysteresis (Schmitt-trigger), holdoff 1 ms, fallback to simple scan
- * 2. Cross-correlation: slope-finder template correlation, peak normalized as confidence
- * 3. Hysteresis lock/bypass: dual-threshold (lock > 0.20, bypass < 0.08) with state memory
- * 4. Edge refinement: ±16 sample nearest-zero-crossing search
+ * Unlike a frame-local edge detector, this engine keeps an aligned waveform from the
+ * previous frame and correlates new candidate edges against it. A slope score acquires
+ * the first edge, autocorrelation limits subsequent searches to a plausible period, and
+ * the aligned buffer preserves the selected waveform phase between UI refreshes.
+ *
+ * CorrScope is Copyright (c) 2018-2020+, nyanpasu64 and distributed under
+ * the BSD 2-Clause License. See THIRD_PARTY_NOTICES.md.
  */
 internal class SimpleTriggerEngine(
     private val windowSize: Int = 512,
@@ -20,6 +27,7 @@ internal class SimpleTriggerEngine(
         val mode: Mode,
         val sampleRateHz: Float,
         val preTriggerRatio: Float = 0.20f,
+        val displayWindowSamples: Int = 512,
         val globalBase: Long = 0L,
         val triggerThreshold: Float = 0.02f,
         val holdoffMs: Float = 1f,
@@ -34,267 +42,366 @@ internal class SimpleTriggerEngine(
         val freqHz: Float,
     )
 
-    // ── Correlation constants ──────────────────────────────────
-    private val kernelSize = 256
-    private val slopeWidth = 32f               // Gaussian std for slope_finder
-    private val lockThreshold = 0.20f           // peak > this → lock
-    private val bypassThreshold = 0.08f         // peak < this → bypass (free-run)
-
-    // ── Zero-crossing constants (shared with step 2) ────────────
-    private val hysteresisRatio = 0.18f
-    private val hysteresisFloorVal = 0.002f
-    private val rmsHysteresisRatioVal = 0.06f
-
-    // ── State ─────────────────────────────────────────────────────
+    private val kernelSize = windowSize.coerceIn(128, 1024).let { it - it % 2 }
+    private val kernelHalf = kernelSize / 2
+    private val correlationBuffer = FloatArray(kernelSize)
+    private val candidateBuffer = FloatArray(kernelSize)
+    private var bufferInitialized = false
     private var lastTriggerGlobalIdx = Long.MIN_VALUE
-    private var lastLockedAnchor = -1           // fallback for hysteresis
-    private var correlationLocked = false       // hysteresis between lock/bypass
-    private var pendingLocalAnchor = -1
-    private var estimatedPeriodSamples = 0f
-
-    // Precomputed slope-finder template (built on first use)
-    private var slopeFinder: FloatArray? = null
-
-    // ═══════════════════════════════════════════════════════════════
-    // PUBLIC API
-    // ═══════════════════════════════════════════════════════════════
+    private var lastGlobalBase = Long.MIN_VALUE
+    private var estimatedPeriodSamples = 0
+    private var processFrame = 0
+    private var autocorrInput = FloatArray(0)
+    private var autocorrOutput = FloatArray(0)
 
     fun process(signal: FloatArray, config: Config): Result {
         val n = signal.size
-        if (config.mode == Mode.OFF || n < 32) {
+        if (config.mode == Mode.OFF || n < kernelSize + 4) {
             reset()
             return Result(0, 0, 0f, false, config.mode, 0f)
         }
-
-        // Resolve pending local anchor
-        if (pendingLocalAnchor >= 0 && config.globalBase >= 0) {
-            lastTriggerGlobalIdx = config.globalBase + pendingLocalAnchor
-            pendingLocalAnchor = -1
+        if (lastGlobalBase != Long.MIN_VALUE && config.globalBase < lastGlobalBase) {
+            reset()
         }
+        lastGlobalBase = config.globalBase
+        processFrame++
 
-        val preferredAnchor = max(1, n / 5)   // spec: 20 % from left
         val isRising = config.mode == Mode.RISING
-
-        val workSignal = signal
-
-        // ── 1. Threshold + hysteresis crossing detection ───────────
-        val threshold = adaptiveThreshold(workSignal, config.triggerThreshold)
-        val rmsVal = rms(workSignal)
-        val hysteresis = maxOf(
-            hysteresisFloorVal,
-            abs(threshold) * hysteresisRatio,
-            rmsVal * rmsHysteresisRatioVal
+        val signalRms = rms(signal)
+        val threshold = max(abs(config.triggerThreshold), signalRms * 0.10f)
+        val hysteresis = max(0.002f, max(threshold * 0.18f, signalRms * 0.06f))
+        val crossings = detectCrossings(
+            signal = signal,
+            threshold = threshold,
+            hysteresis = hysteresis,
+            rising = isRising,
+            holdoffMs = config.holdoffMs,
+            sampleRateHz = config.sampleRateHz,
         )
-        val crossingsRaw = detectCrossings(
-            workSignal, threshold, hysteresis, isRising, config.holdoffMs, config.sampleRateHz
-        )
-        if (crossingsRaw.isEmpty()) {
-            val fb = if (lastTriggerGlobalIdx >= 0) (lastTriggerGlobalIdx - config.globalBase).toInt()
-                .coerceIn(0, n - 1) else n / 2
-            return Result(fb, estimatedPeriodSamples.roundToInt().coerceAtLeast(1), 0f, false, config.mode, 0f)
+        if (crossings.isEmpty() || signalRms < 0.001f) {
+            return unlockedFallback(n, config)
         }
 
-        // ── 2. Cross-correlation with slope-finder template ──────
-        // Build precomputed slope-finder once
-        val sf = slopeFinder ?: buildSlopeFinder(kernelSize, slopeWidth).also { slopeFinder = it }
+        updatePeriodEstimate(signal, config.sampleRateHz)
 
-        // Normalize signal by RMS for amplitude-independent correlation
-        val rmsWork = rms(workSignal)
-        val normSignal = if (rmsWork > 1e-6f) {
-            val scale = 1f / rmsWork
-            FloatArray(n) { workSignal[it] * scale }
+        val displaySamples = config.displayWindowSamples.coerceIn(64, n)
+        val preSamples = (displaySamples * config.preTriggerRatio.coerceIn(0.05f, 0.45f))
+            .roundToInt()
+            .coerceAtLeast(1)
+        val preferredAnchor = (n - displaySamples + preSamples)
+            .coerceIn(kernelHalf, n - kernelHalf - 1)
+        val searchRadius = if (estimatedPeriodSamples > 0) {
+            (estimatedPeriodSamples * 1.5f).roundToInt()
         } else {
-            workSignal
+            max(kernelSize, displaySamples / 2)
+        }.coerceIn(kernelHalf, max(kernelHalf, n / 2))
+
+        var bestAnchor = -1
+        var bestScore = Float.NEGATIVE_INFINITY
+        var bestCorrelation = 0f
+        var foundInRadius = false
+
+        fun scoreCandidates(limitToRadius: Boolean) {
+            for (crossing in crossings) {
+                val anchor = refineZeroCrossing(signal, crossing, isRising)
+                if (anchor < kernelHalf || anchor + kernelHalf > n) continue
+                // The chosen edge must leave enough samples on its right for the
+                // requested display window. Otherwise extractWindow() clamps its
+                // start and the trigger edge no longer lands at preTriggerRatio.
+                if (anchor > preferredAnchor) continue
+                val distance = abs(anchor - preferredAnchor)
+                if (limitToRadius && distance > searchRadius) continue
+
+                foundInRadius = foundInRadius || limitToRadius
+                val edgeScore = edgeScore(
+                    signal,
+                    anchor,
+                    isRising,
+                    estimatedPeriodSamples,
+                    signalRms,
+                )
+                val corrScore = if (bufferInitialized) {
+                    normalizedWindowCorrelation(signal, anchor)
+                } else {
+                    0f
+                }
+                val distanceScale = max(estimatedPeriodSamples, kernelSize).toFloat()
+                val proximityPenalty = 0.08f * (distance / distanceScale).coerceAtMost(2f)
+                val score = if (bufferInitialized) {
+                    corrScore + edgeScore * 0.30f - proximityPenalty
+                } else {
+                    edgeScore - proximityPenalty
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    bestAnchor = anchor
+                    bestCorrelation = corrScore
+                }
+            }
         }
 
-        // Buffer for cross-correlation output: dataSize - kernelSize + 1
-        val corrOut = FloatArray(n - kernelSize + 1)
-        correlate(normSignal, sf, corrOut)
-
-        // Find peak and its magnitude
-        var peakVal = Float.NEGATIVE_INFINITY
-        var peakIdx = 0
-        for (i in corrOut.indices) {
-            if (corrOut[i] > peakVal) { peakVal = corrOut[i]; peakIdx = i }
+        scoreCandidates(limitToRadius = true)
+        if (!foundInRadius || bestAnchor < 0) {
+            scoreCandidates(limitToRadius = false)
         }
-
-        // Normalize peak: divide by kernelSize for amplitude-independent measure
-        val normPeak = (peakVal / kernelSize).coerceIn(0f, 1f)
-
-        // ── 3. Hysteresis lock/bypass ─────────────────────────────
-        val prevLocked = correlationLocked
-        correlationLocked = when {
-            normPeak > lockThreshold       -> true
-            normPeak < bypassThreshold     -> false
-            else                           -> prevLocked  // hold previous state
+        if (bestAnchor < 0) {
+            return unlockedFallback(n, config)
         }
-
-        if (!correlationLocked) {
-            // Free-run: no trigger, return center anchor
-            val center = n / 2
-            lastTriggerGlobalIdx = config.globalBase + center
-            return Result(center, 0, normPeak, false, config.mode, 0f)
+        val confidence = if (bufferInitialized) {
+            ((bestCorrelation + 1f) * 0.5f).coerceIn(0f, 1f)
+        } else {
+            0.5f
         }
+        updateCorrelationBuffer(signal, bestAnchor)
+        lastTriggerGlobalIdx = config.globalBase + bestAnchor
 
-        // Locked: find zero-crossing nearest to correlation peak
-        val corrCenter = peakIdx + kernelSize / 2
-        val bestCrossing = crossingsRaw.minByOrNull { abs(it - corrCenter) }
-            ?: corrCenter.coerceIn(0, n - 1)
-
-        // ── 4. Edge refinement ────────────────────────────────────
-        val finalAnchor = findNearestZeroCross(workSignal, bestCrossing, isRising)
-
-        // ── 6. Update state ───────────────────────────────────────
-        val globalChosen = config.globalBase + finalAnchor
-        lastTriggerGlobalIdx = globalChosen
-        lastLockedAnchor = finalAnchor
-
+        val period = estimatedPeriodSamples.coerceAtLeast(0)
+        val frequency = if (period > 0) config.sampleRateHz / period else 0f
         return Result(
-            finalAnchor,
-            0,      // periodSamples (not estimated in correlation mode)
-            normPeak,
-            true,   // locked
-            config.mode,
-            0f      // freqHz (not estimated in correlation mode)
+            anchorIndex = bestAnchor,
+            periodSamples = period,
+            confidence = confidence,
+            locked = true,
+            mode = config.mode,
+            freqHz = frequency,
         )
     }
 
     fun seekAnchorTo(localAnchor: Int) {
-        if (localAnchor < 0) return
-        pendingLocalAnchor = localAnchor
+        if (localAnchor >= 0 && lastGlobalBase != Long.MIN_VALUE) {
+            lastTriggerGlobalIdx = lastGlobalBase + localAnchor
+        }
     }
 
-    fun extractWindow(source: FloatArray, result: Result, targetSize: Int, preTriggerRatio: Float): FloatArray {
+    fun extractWindow(
+        source: FloatArray,
+        result: Result,
+        targetSize: Int,
+        preTriggerRatio: Float,
+    ): FloatArray {
         if (source.isEmpty() || result.mode == Mode.OFF) return source.copyOf()
-        val tgt = targetSize.coerceAtLeast(64)
-        val pre = (tgt * preTriggerRatio.coerceIn(0.05f, 0.45f)).roundToInt().coerceAtLeast(1)
-        val start = (result.anchorIndex - pre).coerceIn(0, max(0, source.size - tgt))
-        val end = (start + tgt).coerceAtMost(source.size)
-        val win = source.copyOfRange(start, end)
-        return if (win.size == tgt) win else win + FloatArray(tgt - win.size) { 0f }
-    }
-
-    private fun reset() {
-        lastTriggerGlobalIdx = Long.MIN_VALUE
-        estimatedPeriodSamples = 0f
-        pendingLocalAnchor = -1
-        correlationLocked = false
-        lastLockedAnchor = -1
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // CORRELATION ENGINE
-    // ═══════════════════════════════════════════════════════════════
-
-    /** Build a slope-finder template: left half negative, right half positive,
-     *  windowed by a Gaussian to give highest weight to the center (the edge). */
-    private fun buildSlopeFinder(size: Int, sigma: Float): FloatArray {
-        val half = size / 2
-        val out = FloatArray(size)
-        // Gaussian: exp(-0.5 * (i - center)^2 / sigma^2), center = (size-1)/2
-        val center = (size - 1) / 2f
-        for (i in 0 until size) {
-            val x = (i - center) / sigma
-            val w = kotlin.math.exp(-0.5f * x * x)
-            out[i] = if (i < half) -w else w
-        }
-        return out
-    }
-
-    /** Direct O(N*K) cross-correlation of signal with kernel.
-     *  output[i] = sum over j of signal[i + j] * kernel[j]
-     *  output length = signal.size - kernel.size + 1 */
-    private fun correlate(signal: FloatArray, kernel: FloatArray, output: FloatArray) {
-        val n = signal.size
-        val k = kernel.size
-        var i = 0
-        while (i < output.size) {
-            var sum = 0f
-            var j = 0
-            while (j < k) {
-                sum += signal[i + j] * kernel[j]
-                j++
-            }
-            output[i] = sum
-            i++
+        val target = targetSize.coerceAtLeast(64)
+        val pre = (target * preTriggerRatio.coerceIn(0.05f, 0.45f))
+            .roundToInt()
+            .coerceAtLeast(1)
+        val start = (result.anchorIndex - pre).coerceIn(0, max(0, source.size - target))
+        val end = (start + target).coerceAtMost(source.size)
+        val window = source.copyOfRange(start, end)
+        return if (window.size == target) {
+            window
+        } else {
+            window + FloatArray(target - window.size)
         }
     }
 
-    /** Scan ±16 samples around [center] for the nearest zero-crossing in
-     *  the desired direction. If none found, return center unchanged. */
-    private fun findNearestZeroCross(samples: FloatArray, center: Int, rising: Boolean): Int {
-        val n = samples.size
-        val radius = 16
-        for (dist in 0..radius) {
-            for (dir in intArrayOf(1, -1)) {
-                val idx = center + dist * dir
-                if (idx !in 1 until n - 1) continue
-                if (rising && samples[idx - 1] < 0f && samples[idx] >= 0f) return idx
-                if (!rising && samples[idx - 1] > 0f && samples[idx] <= 0f) return idx
+    private fun updatePeriodEstimate(signal: FloatArray, sampleRateHz: Float) {
+        if (processFrame != 1 && processFrame % 8 != 0) return
+
+        val downsample = 2
+        val sourceCount = min(signal.size, 4096)
+        val sourceStart = signal.size - sourceCount
+        val count = sourceCount / downsample
+        if (count < 64) return
+        if (autocorrInput.size < count) autocorrInput = FloatArray(count)
+        for (i in 0 until count) {
+            autocorrInput[i] = signal[sourceStart + i * downsample]
+        }
+
+        val effectiveRate = sampleRateHz / downsample
+        val maxLag = min(count - 1, (effectiveRate / 10f).roundToInt())
+        if (maxLag < 16) return
+        if (autocorrOutput.size < maxLag + 1) autocorrOutput = FloatArray(maxLag + 1)
+        Autocorrelation.computeNormalized(
+            x = autocorrInput,
+            start = 0,
+            len = count,
+            maxLag = maxLag + 1,
+            out = autocorrOutput,
+        )
+        val lag = Autocorrelation.estimatePeriodFromAutocorrSeeded(
+            ac = autocorrOutput,
+            acLen = maxLag + 1,
+            dt = 1f / effectiveRate,
+            fMinHz = 10f,
+            fMaxHz = 4000f,
+            seedLag = if (estimatedPeriodSamples > 0) estimatedPeriodSamples / downsample else 0,
+        )
+        if (lag > 0) {
+            val candidate = lag * downsample
+            estimatedPeriodSamples = if (estimatedPeriodSamples > 0) {
+                (estimatedPeriodSamples * 0.75f + candidate * 0.25f).roundToInt()
+            } else {
+                candidate
             }
         }
-        return center.coerceIn(1, n - 2)
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // STEP 2: ZERO-CROSSING DETECTION (hysteresis + holdoff)
-    // ═══════════════════════════════════════════════════════════════
+    private fun normalizedWindowCorrelation(signal: FloatArray, anchor: Int): Float {
+        val start = anchor - kernelHalf
+        var mean = 0f
+        for (i in 0 until kernelSize) mean += signal[start + i]
+        mean /= kernelSize
 
-    private fun adaptiveThreshold(samples: FloatArray, userThr: Float): Float {
-        return max(abs(userThr), rms(samples) * 0.10f)
+        var dot = 0f
+        var candidateEnergy = 0f
+        var bufferEnergy = 0f
+        for (i in 0 until kernelSize) {
+            val candidate = signal[start + i] - mean
+            candidateBuffer[i] = candidate
+            dot += candidate * correlationBuffer[i]
+            candidateEnergy += candidate * candidate
+            bufferEnergy += correlationBuffer[i] * correlationBuffer[i]
+        }
+        val denom = sqrt(candidateEnergy * bufferEnergy).coerceAtLeast(1e-6f)
+        return (dot / denom).coerceIn(-1f, 1f)
     }
 
-    private fun rms(samples: FloatArray): Float {
-        if (samples.isEmpty()) return 0f
-        var e = 0f; for (s in samples) e += s * s
-        return sqrt(e / samples.size)
+    private fun updateCorrelationBuffer(signal: FloatArray, anchor: Int) {
+        val start = anchor - kernelHalf
+        var mean = 0f
+        for (i in 0 until kernelSize) mean += signal[start + i]
+        mean /= kernelSize
+
+        var peak = 0f
+        for (i in 0 until kernelSize) {
+            candidateBuffer[i] = signal[start + i] - mean
+            peak = max(peak, abs(candidateBuffer[i]))
+        }
+        val scale = 1f / max(peak, 0.01f)
+        val std = if (estimatedPeriodSamples > 0) {
+            (estimatedPeriodSamples * 0.5f).coerceIn(8f, kernelHalf.toFloat())
+        } else {
+            kernelSize / 4f
+        }
+        val responsiveness = if (bufferInitialized) 0.20f else 1f
+        val center = (kernelSize - 1) / 2f
+        for (i in 0 until kernelSize) {
+            val x = (i - center) / std
+            val window = exp(-0.5f * x * x)
+            val aligned = candidateBuffer[i] * scale * window
+            correlationBuffer[i] += responsiveness * (aligned - correlationBuffer[i])
+        }
+        bufferInitialized = true
     }
 
-    /**
-     * Dual-threshold hysteresis (Schmitt-trigger):
-     *   rising: arm below lowThr, fire when crossing above highThr
-     *   falling: arm above highThr, fire when crossing below lowThr
-     * Holdoff suppresses crossings for 1 ms after a fire.
-     * Fallback: simple zero-crossing scan if hysteresis finds nothing.
-     */
+    private fun edgeScore(
+        signal: FloatArray,
+        anchor: Int,
+        rising: Boolean,
+        periodSamples: Int,
+        signalRms: Float,
+    ): Float {
+        val radius = if (periodSamples > 0) {
+            (periodSamples * 0.25f).roundToInt()
+        } else {
+            kernelSize / 8
+        }.coerceIn(2, kernelSize / 3)
+        var left = 0f
+        var right = 0f
+        for (i in 1..radius) {
+            left += signal[anchor - i]
+            right += signal[anchor + i - 1]
+        }
+        val slope = (right - left) / radius
+        val directed = if (rising) slope else -slope
+        return (directed / max(signalRms, 0.01f)).coerceIn(-2f, 2f) * 0.5f
+    }
+
     private fun detectCrossings(
-        signal: FloatArray, threshold: Float, hysteresis: Float, isRising: Boolean,
-        holdoffMs: Float, sampleRateHz: Float
+        signal: FloatArray,
+        threshold: Float,
+        hysteresis: Float,
+        rising: Boolean,
+        holdoffMs: Float,
+        sampleRateHz: Float,
     ): List<Int> {
-        val n = signal.size
-        if (n < 3) return emptyList()
-        val lowThr = threshold - hysteresis
-        val highThr = threshold + hysteresis
-        val holdoffS = ((holdoffMs * sampleRateHz) / 1000f).roundToInt().coerceAtLeast(1)
-
-        val result = mutableListOf<Int>()
-        var armed = if (isRising) signal[0] <= lowThr else signal[0] >= highThr
-        var lastFire = -holdoffS - 1
-
-        for (i in 1 until n - 1) {
-            val prev = signal[i - 1];
-            val curr = signal[i]
-            if (isRising) {
-                if (prev <= lowThr) armed = true
-                if (armed && prev <= highThr && curr > highThr && (i - lastFire) >= holdoffS) {
-                    result.add(i); lastFire = i; armed = false
+        val low = threshold - hysteresis
+        val high = threshold + hysteresis
+        val holdoff = ((holdoffMs * sampleRateHz) / 1000f)
+            .roundToInt()
+            .coerceAtLeast(1)
+        val result = ArrayList<Int>()
+        var armed = if (rising) signal[0] <= low else signal[0] >= high
+        var lastFire = -holdoff - 1
+        for (i in 1 until signal.lastIndex) {
+            val previous = signal[i - 1]
+            val current = signal[i]
+            if (rising) {
+                if (previous <= low) armed = true
+                if (armed && previous <= high && current > high && i - lastFire >= holdoff) {
+                    result += i
+                    lastFire = i
+                    armed = false
                 }
             } else {
-                if (prev >= highThr) armed = true
-                if (armed && prev >= lowThr && curr < lowThr && (i - lastFire) >= holdoffS) {
-                    result.add(i); lastFire = i; armed = false
+                if (previous >= high) armed = true
+                if (armed && previous >= low && current < low && i - lastFire >= holdoff) {
+                    result += i
+                    lastFire = i
+                    armed = false
                 }
             }
         }
-
-        // fallback: simple zero-crossing
         if (result.isEmpty()) {
-            for (i in 1 until n) {
-                if (isRising && signal[i - 1] < 0f && signal[i] >= 0f) result.add(i)
-                else if (!isRising && signal[i - 1] > 0f && signal[i] <= 0f) result.add(i)
+            for (i in 1 until signal.size) {
+                if (rising && signal[i - 1] < 0f && signal[i] >= 0f) result += i
+                if (!rising && signal[i - 1] > 0f && signal[i] <= 0f) result += i
             }
         }
         return result
     }
 
+    private fun refineZeroCrossing(signal: FloatArray, center: Int, rising: Boolean): Int {
+        val radius = 32
+        var best = center.coerceIn(1, signal.lastIndex)
+        var bestDistance = Int.MAX_VALUE
+        val begin = max(1, center - radius)
+        val end = min(signal.lastIndex, center + radius)
+        for (i in begin..end) {
+            val crossing = if (rising) {
+                signal[i - 1] < 0f && signal[i] >= 0f
+            } else {
+                signal[i - 1] > 0f && signal[i] <= 0f
+            }
+            if (crossing && abs(i - center) < bestDistance) {
+                best = i
+                bestDistance = abs(i - center)
+            }
+        }
+        return best
+    }
+
+    private fun unlockedFallback(n: Int, config: Config): Result {
+        val local = if (lastTriggerGlobalIdx != Long.MIN_VALUE) {
+            (lastTriggerGlobalIdx - config.globalBase).toInt().coerceIn(0, n - 1)
+        } else {
+            n / 2
+        }
+        val period = estimatedPeriodSamples.coerceAtLeast(0)
+        return Result(
+            anchorIndex = local,
+            periodSamples = period,
+            confidence = 0f,
+            locked = false,
+            mode = config.mode,
+            freqHz = if (period > 0) config.sampleRateHz / period else 0f,
+        )
+    }
+
+    private fun rms(signal: FloatArray): Float {
+        if (signal.isEmpty()) return 0f
+        var energy = 0f
+        for (sample in signal) energy += sample * sample
+        return sqrt(energy / signal.size)
+    }
+
+    private fun reset() {
+        correlationBuffer.fill(0f)
+        candidateBuffer.fill(0f)
+        bufferInitialized = false
+        lastTriggerGlobalIdx = Long.MIN_VALUE
+        lastGlobalBase = Long.MIN_VALUE
+        estimatedPeriodSamples = 0
+        processFrame = 0
+    }
 }

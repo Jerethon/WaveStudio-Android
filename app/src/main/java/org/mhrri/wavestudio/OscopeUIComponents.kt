@@ -674,9 +674,11 @@ fun EqPanel(
     filterGain: Float,
     lowPassEnabled: Boolean,
     lowPassCutoff: Float,
+    lowPassStageCutoffs: List<Float>,
     lowPassOrder: Int,
     highPassEnabled: Boolean,
     highPassCutoff: Float,
+    highPassStageCutoffs: List<Float>,
     highPassOrder: Int,
     sampleRate: Int,
 ) {
@@ -752,8 +754,12 @@ fun EqPanel(
             selectedId = selectedId,
             lowPassEnabled = lowPassEnabled,
             lowPassCutoff = lowPassCutoff,
+            lowPassStageCutoffs = lowPassStageCutoffs,
+            lowPassOrder = lowPassOrder,
             highPassEnabled = highPassEnabled,
             highPassCutoff = highPassCutoff,
+            highPassStageCutoffs = highPassStageCutoffs,
+            highPassOrder = highPassOrder,
             filterGain = filterGain,
             sampleRate = sampleRate,
             draggable = draggable,
@@ -1025,8 +1031,12 @@ fun EqResponseGraph(
     selectedId: Int,
     lowPassEnabled: Boolean,
     lowPassCutoff: Float,
+    lowPassStageCutoffs: List<Float>,
+    lowPassOrder: Int,
     highPassEnabled: Boolean,
     highPassCutoff: Float,
+    highPassStageCutoffs: List<Float>,
+    highPassOrder: Int,
     filterGain: Float,
     sampleRate: Int,
     draggable: Boolean = false,
@@ -1156,7 +1166,20 @@ fun EqResponseGraph(
         }
 
         // Compute combined EQ response (dB) across freqs using RBJ peaking formula for each enabled band
-        val respDb = computeEqResponse(sorted, freqs, lowPassEnabled, lowPassCutoff, highPassEnabled, highPassCutoff, filterGain, sampleRate)
+        val respDb = computeEqResponse(
+            bands = sorted,
+            freqs = freqs,
+            lowPassEnabled = lowPassEnabled,
+            lowPassCutoff = lowPassCutoff,
+            lowPassStageCutoffs = lowPassStageCutoffs,
+            lowPassOrder = lowPassOrder,
+            highPassEnabled = highPassEnabled,
+            highPassCutoff = highPassCutoff,
+            highPassStageCutoffs = highPassStageCutoffs,
+            highPassOrder = highPassOrder,
+            filterGain = filterGain,
+            sampleRate = sampleRate,
+        )
 
         // Draw smooth curve using the computed dB values
         val curvePath = Path()
@@ -1179,4 +1202,3 @@ fun EqResponseGraph(
         }
     }
 }
-

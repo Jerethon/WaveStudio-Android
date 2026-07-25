@@ -381,12 +381,16 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     private val _lowPassCutoff = MutableStateFlow(20000f)
     val lowPassCutoff: StateFlow<Float> = _lowPassCutoff.asStateFlow()
+    private val _lowPassStageCutoffs = MutableStateFlow(List(8) { 20000f })
+    val lowPassStageCutoffs: StateFlow<List<Float>> = _lowPassStageCutoffs.asStateFlow()
 
     private val _highPassEnabled = MutableStateFlow(false)
     val highPassEnabled: StateFlow<Boolean> = _highPassEnabled.asStateFlow()
 
     private val _highPassCutoff = MutableStateFlow(30f)
     val highPassCutoff: StateFlow<Float> = _highPassCutoff.asStateFlow()
+    private val _highPassStageCutoffs = MutableStateFlow(List(8) { 30f })
+    val highPassStageCutoffs: StateFlow<List<Float>> = _highPassStageCutoffs.asStateFlow()
 
     // Global 1Hz high-pass setting (exposed in settings)
     private val _globalHighPassEnabled = MutableStateFlow(true)
@@ -751,6 +755,18 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     fun updateLowPassSlider(value: Float) {
         _lowPassCutoff.value = value
+        _lowPassStageCutoffs.update { cutoffs ->
+            cutoffs.toMutableList().also { it[0] = value }
+        }
+    }
+
+    fun updateLowPassStageCutoff(stageIndex: Int, value: Float) {
+        if (stageIndex !in 0 until 8) return
+        val cutoff = value.coerceIn(600f, 30001f)
+        _lowPassStageCutoffs.update { cutoffs ->
+            cutoffs.toMutableList().also { it[stageIndex] = cutoff }
+        }
+        if (stageIndex == 0) _lowPassCutoff.value = cutoff
     }
 
     fun toggleHighPass(enabled: Boolean) {
@@ -759,6 +775,18 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     fun updateHighPassSlider(value: Float) {
         _highPassCutoff.value = value
+        _highPassStageCutoffs.update { cutoffs ->
+            cutoffs.toMutableList().also { it[0] = value }
+        }
+    }
+
+    fun updateHighPassStageCutoff(stageIndex: Int, value: Float) {
+        if (stageIndex !in 0 until 8) return
+        val cutoff = value.coerceIn(20f, 10000f)
+        _highPassStageCutoffs.update { cutoffs ->
+            cutoffs.toMutableList().also { it[stageIndex] = cutoff }
+        }
+        if (stageIndex == 0) _highPassCutoff.value = cutoff
     }
 
     fun updateTimeSlider(value: Float) {
@@ -1218,9 +1246,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 lowPassEnabled = lowPassEnabled.value,
                                 lowPassCutoffHz = lowPassCutoff.value,
                                 lowPassOrder = lowPassOrder.value,
+                                lowPassStageCutoffsHz = lowPassStageCutoffs.value,
                                 highPassEnabled = highPassEnabled.value,
                                 highPassCutoffHz = highPassCutoff.value,
                                 highPassOrder = highPassOrder.value,
+                                highPassStageCutoffsHz = highPassStageCutoffs.value,
                                 filterGain = filterGain.value,
                                 eqEnabled = eqEnabled.value,
                                 eqBands = eqBands.value,
@@ -1340,9 +1370,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                 lowPassEnabled = lowPassEnabled.value,
                                 lowPassCutoffHz = lowPassCutoff.value,
                                 lowPassOrder = lowPassOrder.value,
+                                lowPassStageCutoffsHz = lowPassStageCutoffs.value,
                                 highPassEnabled = highPassEnabled.value,
                                 highPassCutoffHz = highPassCutoff.value,
                                 highPassOrder = highPassOrder.value,
+                                highPassStageCutoffsHz = highPassStageCutoffs.value,
                                 filterGain = filterGain.value,
                                 eqEnabled = eqEnabled.value,
                                 eqBands = eqBands.value,
@@ -1384,6 +1416,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                     mode = SimpleTriggerEngine.Mode.RISING,
                                     sampleRateHz = sampleRate.toFloat(),
                                     preTriggerRatio = 0.20f,
+                                    displayWindowSamples = displayCount,
                                     globalBase = totalSamplesWritten - fillCount,
                                     triggerThreshold = 0.02f,
                                     holdoffMs = 1f,
@@ -1817,9 +1850,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                             lowPassEnabled = lowPassEnabled.value,
                             lowPassCutoffHz = lowPassCutoff.value,
                             lowPassOrder = lowPassOrder.value,
+                            lowPassStageCutoffsHz = lowPassStageCutoffs.value,
                             highPassEnabled = highPassEnabled.value,
                             highPassCutoffHz = highPassCutoff.value,
                             highPassOrder = highPassOrder.value,
+                            highPassStageCutoffsHz = highPassStageCutoffs.value,
                             filterGain = filterGain.value,
                             eqEnabled = eqEnabled.value,
                             eqBands = eqBands.value,
@@ -1910,9 +1945,11 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                     lowPassEnabled = lowPassEnabled.value,
                                     lowPassCutoffHz = lowPassCutoff.value,
                                     lowPassOrder = lowPassOrder.value,
+                                    lowPassStageCutoffsHz = lowPassStageCutoffs.value,
                                     highPassEnabled = highPassEnabled.value,
                                     highPassCutoffHz = highPassCutoff.value,
                                     highPassOrder = highPassOrder.value,
+                                    highPassStageCutoffsHz = highPassStageCutoffs.value,
                                     filterGain = filterGain.value,
                                     eqEnabled = eqEnabled.value,
                                     eqBands = eqBands.value,
@@ -1957,6 +1994,7 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
                                         mode = SimpleTriggerEngine.Mode.RISING,
                                         sampleRateHz = sampleRate.toFloat(),
                                         preTriggerRatio = 0.20f,
+                                        displayWindowSamples = displayCount,
                                         globalBase = totalSamplesWritten - fillCount,
                                         triggerThreshold = 0.02f,
                                         holdoffMs = 1f,
@@ -3129,17 +3167,21 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         // RC 等效：频率即截止频率；阶数即级联层数
         // 每一层都是一个一阶 RC 滤波器
         if (lowPassEnabled) {
-            val fc = lowPassCutoffHz.coerceIn(5f, nyquist)
             val order = _lowPassOrder.value.coerceIn(1, 8)
-            repeat(order) {
+            repeat(order) { stage ->
+                val fc = _lowPassStageCutoffs.value
+                    .getOrElse(stage) { lowPassCutoffHz }
+                    .coerceIn(5f, nyquist)
                 out = firstOrderLowPass(out, sampleRate, fc)
             }
         }
 
         if (highPassEnabled) {
-            val fc = highPassCutoffHz.coerceIn(5f, nyquist)
             val order = _highPassOrder.value.coerceIn(1, 8)
-            repeat(order) {
+            repeat(order) { stage ->
+                val fc = _highPassStageCutoffs.value
+                    .getOrElse(stage) { highPassCutoffHz }
+                    .coerceIn(5f, nyquist)
                 out = firstOrderHighPass(out, sampleRate, fc)
             }
         }
@@ -3431,6 +3473,18 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     // accidentally existed here in some merges.)
 
     /** 导出当前参数为预设（用于导出/分享） */
+    private fun normalizeStageCutoffs(
+        values: List<Float>,
+        fallback: Float,
+        minimum: Float,
+        maximum: Float,
+    ): List<Float> {
+        val source = values.ifEmpty { listOf(fallback) }
+        return List(8) { index ->
+            source.getOrElse(index) { source.last() }.coerceIn(minimum, maximum)
+        }
+    }
+
     fun exportPreset(name: String? = null): FilterPreset {
         val bands = _eqBands.value.map {
             FilterPreset.EqBandPreset(
@@ -3444,14 +3498,16 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         return FilterPreset(
-            schemaVersion = 1,
+            schemaVersion = 2,
             name = name,
             lowPassEnabled = _lowPassEnabled.value,
             lowPassCutoffHz = _lowPassCutoff.value,
             lowPassOrder = _lowPassOrder.value,
+            lowPassStageCutoffsHz = _lowPassStageCutoffs.value.take(_lowPassOrder.value),
             highPassEnabled = _highPassEnabled.value,
             highPassCutoffHz = _highPassCutoff.value,
             highPassOrder = _highPassOrder.value,
+            highPassStageCutoffsHz = _highPassStageCutoffs.value.take(_highPassOrder.value),
             filterGain = _filterGain.value,
             windowMs = _windowMs.value,
             ampScale = _ampScale.value,
@@ -3464,12 +3520,26 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     fun applyPreset(preset: FilterPreset) {
         // clamps to match UI ranges / safety
         _lowPassEnabled.value = preset.lowPassEnabled
-        _lowPassCutoff.value = preset.lowPassCutoffHz.coerceIn(200f, 30001f)
+        _lowPassCutoff.value = preset.lowPassCutoffHz.coerceIn(600f, 30001f)
         _lowPassOrder.value = preset.lowPassOrder.coerceIn(1, 8)
+        _lowPassStageCutoffs.value = normalizeStageCutoffs(
+            preset.lowPassStageCutoffsHz,
+            _lowPassCutoff.value,
+            600f,
+            30001f,
+        )
+        _lowPassCutoff.value = _lowPassStageCutoffs.value.first()
 
         _highPassEnabled.value = preset.highPassEnabled
-        _highPassCutoff.value = preset.highPassCutoffHz.coerceIn(2f, 2001f)
+        _highPassCutoff.value = preset.highPassCutoffHz.coerceIn(20f, 10000f)
         _highPassOrder.value = preset.highPassOrder.coerceIn(1, 8)
+        _highPassStageCutoffs.value = normalizeStageCutoffs(
+            preset.highPassStageCutoffsHz,
+            _highPassCutoff.value,
+            20f,
+            10000f,
+        )
+        _highPassCutoff.value = _highPassStageCutoffs.value.first()
 
         _filterGain.value = preset.filterGain.coerceIn(0.1f, 100f)
 
@@ -3506,10 +3576,12 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
     fun resetFilterPresetToDefault() {
         _lowPassEnabled.value = false
         _lowPassCutoff.value = 20000f
+        _lowPassStageCutoffs.value = List(8) { 20000f }
         _lowPassOrder.value = 1
 
         _highPassEnabled.value = false
         _highPassCutoff.value = 50f
+        _highPassStageCutoffs.value = List(8) { 50f }
         _highPassOrder.value = 1
 
         _filterGain.value = 1f
@@ -3692,8 +3764,8 @@ private class RtBiquadCascade(private var sampleRate: Int) {
 
     private var lastLpEnabled = false
     private var lastHpEnabled = false
-    private var lastLpCutoff = -1f
-    private var lastHpCutoff = -1f
+    private var lastLpCutoffs: List<Float> = emptyList()
+    private var lastHpCutoffs: List<Float> = emptyList()
     private var lastLpOrder = -1
     private var lastHpOrder = -1
 
@@ -3710,9 +3782,11 @@ private class RtBiquadCascade(private var sampleRate: Int) {
         lowPassEnabled: Boolean,
         lowPassCutoffHz: Float,
         lowPassOrder: Int,
+        lowPassStageCutoffsHz: List<Float>,
         highPassEnabled: Boolean,
         highPassCutoffHz: Float,
         highPassOrder: Int,
+        highPassStageCutoffsHz: List<Float>,
         filterGain: Float,
         eqEnabled: Boolean,
         eqBands: List<AudioEngineViewModel.EqBand>,
@@ -3723,8 +3797,8 @@ private class RtBiquadCascade(private var sampleRate: Int) {
         if (this.sampleRate != sampleRate) {
             this.sampleRate = sampleRate
             resetState()
-            lastLpCutoff = -1f
-            lastHpCutoff = -1f
+            lastLpCutoffs = emptyList()
+            lastHpCutoffs = emptyList()
             lastFilterGain = -1f
             lastEqBands = null
             eqChanged = true
@@ -3739,42 +3813,51 @@ private class RtBiquadCascade(private var sampleRate: Int) {
             globalHpCoef = rtDesignRCHighPass(this.sampleRate, lastGlobalHpCutoff)
         }
 
+        val lpOrder = lowPassOrder.coerceIn(1, 8)
+        val effectiveLpCutoffs = List(lpOrder) { stage ->
+            lowPassStageCutoffsHz.getOrElse(stage) { lowPassCutoffHz }
+                .coerceIn(5f, sampleRate / 2f - 1f)
+        }
         if (lowPassEnabled != lastLpEnabled ||
-            (lowPassEnabled && (lowPassCutoffHz != lastLpCutoff || lowPassOrder != lastLpOrder))
+            (lowPassEnabled && (effectiveLpCutoffs != lastLpCutoffs || lowPassOrder != lastLpOrder))
         ) {
             if (lowPassEnabled) {
-                // Generate N identical RC stages
-                val order = lowPassOrder.coerceIn(1, 8)
-                val baseExp = rtDesignRCLowPass(sampleRate, lowPassCutoffHz.coerceAtLeast(5f))
-                lpCoefs = List(order) { baseExp }
-                if (lpZ1.size < order) {
-                    lpZ1 = FloatArray(order)
-                    lpZ2 = FloatArray(order)
+                lpCoefs = effectiveLpCutoffs.map { cutoff ->
+                    rtDesignRCLowPass(sampleRate, cutoff)
+                }
+                if (lpZ1.size < lpOrder) {
+                    lpZ1 = FloatArray(lpOrder)
+                    lpZ2 = FloatArray(lpOrder)
                 }
             } else {
                 lpCoefs = emptyList()
             }
             lastLpEnabled = lowPassEnabled
-            lastLpCutoff = lowPassCutoffHz
+            lastLpCutoffs = effectiveLpCutoffs
             lastLpOrder = lowPassOrder
         }
 
+        val hpOrder = highPassOrder.coerceIn(1, 8)
+        val effectiveHpCutoffs = List(hpOrder) { stage ->
+            highPassStageCutoffsHz.getOrElse(stage) { highPassCutoffHz }
+                .coerceIn(5f, sampleRate / 2f - 1f)
+        }
         if (highPassEnabled != lastHpEnabled ||
-            (highPassEnabled && (highPassCutoffHz != lastHpCutoff || highPassOrder != lastHpOrder))
+            (highPassEnabled && (effectiveHpCutoffs != lastHpCutoffs || highPassOrder != lastHpOrder))
         ) {
             if (highPassEnabled) {
-                val order = highPassOrder.coerceIn(1, 8)
-                val baseExp = rtDesignRCHighPass(sampleRate, highPassCutoffHz.coerceAtLeast(5f))
-                hpCoefs = List(order) { baseExp }
-                if (hpZ1.size < order) {
-                    hpZ1 = FloatArray(order)
-                    hpZ2 = FloatArray(order)
+                hpCoefs = effectiveHpCutoffs.map { cutoff ->
+                    rtDesignRCHighPass(sampleRate, cutoff)
+                }
+                if (hpZ1.size < hpOrder) {
+                    hpZ1 = FloatArray(hpOrder)
+                    hpZ2 = FloatArray(hpOrder)
                 }
             } else {
                 hpCoefs = emptyList()
             }
             lastHpEnabled = highPassEnabled
-            lastHpCutoff = highPassCutoffHz
+            lastHpCutoffs = effectiveHpCutoffs
             lastHpOrder = highPassOrder
         }
 

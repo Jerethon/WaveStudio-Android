@@ -9,17 +9,19 @@ import org.json.JSONObject
  * - schemaVersion 用于后续兼容扩展
  */
 data class FilterPreset(
-    val schemaVersion: Int = 1,
+    val schemaVersion: Int = 2,
     val name: String? = null,
 
     // HP/LP
     val lowPassEnabled: Boolean,
     val lowPassCutoffHz: Float,
     val lowPassOrder: Int,
+    val lowPassStageCutoffsHz: List<Float> = listOf(lowPassCutoffHz),
 
     val highPassEnabled: Boolean,
     val highPassCutoffHz: Float,
     val highPassOrder: Int,
+    val highPassStageCutoffsHz: List<Float> = listOf(highPassCutoffHz),
 
     // gains / display
     val filterGain: Float,
@@ -50,6 +52,7 @@ data class FilterPreset(
                 .put("enabled", lowPassEnabled)
                 .put("cutoffHz", lowPassCutoffHz)
                 .put("order", lowPassOrder)
+                .put("stageCutoffsHz", JSONArray(lowPassStageCutoffsHz))
         )
         root.put(
             "highPass",
@@ -57,6 +60,7 @@ data class FilterPreset(
                 .put("enabled", highPassEnabled)
                 .put("cutoffHz", highPassCutoffHz)
                 .put("order", highPassOrder)
+                .put("stageCutoffsHz", JSONArray(highPassStageCutoffsHz))
         )
 
         root.put(
@@ -122,15 +126,36 @@ data class FilterPreset(
                 )
             }
 
+            fun stageCutoffs(
+                filter: JSONObject,
+                fallbackCutoff: Float,
+                order: Int,
+            ): List<Float> {
+                val array = filter.optJSONArray("stageCutoffsHz")
+                if (array == null || array.length() == 0) {
+                    return List(order.coerceIn(1, 8)) { fallbackCutoff }
+                }
+                return List(array.length().coerceAtMost(8)) { index ->
+                    array.optDouble(index, fallbackCutoff.toDouble()).toFloat()
+                }
+            }
+
+            val lowPassCutoff = lp.optDouble("cutoffHz", 15000.0).toFloat()
+            val lowPassOrder = lp.optInt("order", 2)
+            val highPassCutoff = hp.optDouble("cutoffHz", 20.0).toFloat()
+            val highPassOrder = hp.optInt("order", 2)
+
             return FilterPreset(
                 schemaVersion = schemaVersion,
                 name = name,
                 lowPassEnabled = lp.optBoolean("enabled", false),
-                lowPassCutoffHz = lp.optDouble("cutoffHz", 15000.0).toFloat(),
-                lowPassOrder = lp.optInt("order", 2),
+                lowPassCutoffHz = lowPassCutoff,
+                lowPassOrder = lowPassOrder,
+                lowPassStageCutoffsHz = stageCutoffs(lp, lowPassCutoff, lowPassOrder),
                 highPassEnabled = hp.optBoolean("enabled", false),
-                highPassCutoffHz = hp.optDouble("cutoffHz", 20.0).toFloat(),
-                highPassOrder = hp.optInt("order", 2),
+                highPassCutoffHz = highPassCutoff,
+                highPassOrder = highPassOrder,
+                highPassStageCutoffsHz = stageCutoffs(hp, highPassCutoff, highPassOrder),
                 filterGain = gain.optDouble("filterGain", 1.0).toFloat(),
                 windowMs = display.optDouble("windowMs", 30.0).toFloat(),
                 ampScale = display.optDouble("ampScale", 1.0).toFloat(),
