@@ -3,6 +3,17 @@
     <!-- About changelog -->
     <string name="about_changelog_version_title">%1$s 版本主要更新内容：</string>
 
+    <string-array name="about_changelog_v0181">
+        <item>优化 Trigger 的高低频路径分流，低基频继续使用辅助周期估计和全局相位预测</item>
+        <item>高基频恢复 CorrScope 风格的波形相关匹配，提升谐波丰富信号的稳定性</item>
+        <item>修复高基频被误判为低频子谐波，以及频率升高后低频辅助未及时退出的问题</item>
+    </string-array>
+    <string-array name="about_changelog_v0180">
+        <item>低通和高通滤波器支持多级级联，并可分别调整每一级的截止频率</item>
+        <item>高通截止频率范围调整为 20–10000 Hz，默认值调整为 20 Hz</item>
+        <item>优化低基频 Trigger，新增低频辅助周期估计和全局相位预测，增强弱基波与强谐波场景下的稳定性</item>
+        <item>简化 Trigger 配置，移除源模式选择和信号调节选项</item>
+    </string-array>
     <string-array name="about_changelog_v0170">
         <item>重构关于菜单</item>
         <item>大幅优化 Trigger 功能</item>

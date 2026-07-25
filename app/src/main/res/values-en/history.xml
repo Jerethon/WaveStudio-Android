@@ -3,6 +3,17 @@
     <!-- About changelog -->
     <string name="about_changelog_version_title">Key updates in version %1$s:</string>
 
+    <string-array name="about_changelog_v0181">
+        <item>Separated the low- and high-frequency Trigger paths while retaining assisted period estimation and global phase prediction for low fundamentals</item>
+        <item>Restored CorrScope-style waveform correlation matching at higher frequencies for improved stability with harmonic-rich signals</item>
+        <item>Fixed high fundamentals being mistaken for low subharmonics and delayed release of low-frequency assistance after a frequency increase</item>
+    </string-array>
+    <string-array name="about_changelog_v0180">
+        <item>Added multi-stage cascades for low-pass and high-pass filters, with an independently adjustable cutoff for each stage</item>
+        <item>Changed the high-pass cutoff range to 20–10000 Hz and the default cutoff to 20 Hz</item>
+        <item>Improved low-fundamental Trigger stability with low-frequency-assisted period estimation and global phase prediction for weak-fundamental and strong-harmonic signals</item>
+        <item>Simplified Trigger settings by removing source mode selection and signal conditioning options</item>
+    </string-array>
     <string-array name="about_changelog_v0170">
         <item>Refactored the About menu</item>
         <item>Optimized Trigger functionality</item>

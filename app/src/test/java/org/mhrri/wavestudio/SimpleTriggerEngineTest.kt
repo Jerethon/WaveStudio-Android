@@ -2,6 +2,7 @@ package org.mhrri.wavestudio
 
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import org.junit.Assert.assertTrue
@@ -58,6 +59,99 @@ class SimpleTriggerEngineTest {
                 assertEdgeAtDisplayReference(sineFrame(globalBase), result)
             }
         }
+    }
+
+    @Test
+    fun highFrequencyHarmonicWaveformKeepsTheSameCorrelationPhase() {
+        val frequency = 220f
+        val engine = SimpleTriggerEngine()
+        val samplesPerFrame = (sampleRate / 60f).roundToInt()
+        val phases = ArrayList<Double>()
+        val estimatedFrequencies = ArrayList<Float>()
+
+        repeat(48) { frame ->
+            val globalBase = frame.toLong() * samplesPerFrame
+            val source = highFrequencyHarmonicFrame(
+                globalBase = globalBase,
+                frequency = frequency,
+                size = 4_800,
+            )
+            val result = engine.process(
+                source,
+                config(globalBase).copy(displayWindowSamples = 2_400),
+            )
+            assertTrue("frame=$frame did not lock", result.locked)
+            if (frame >= 8) {
+                phases += phaseFraction(globalBase + result.anchorIndex, frequency)
+                estimatedFrequencies += result.freqHz
+            }
+        }
+
+        val reference = phases.first()
+        val maxPhaseJump = phases.maxOf { phase ->
+            val direct = abs(phase - reference)
+            minOf(direct, 1.0 - direct)
+        }
+        assertTrue(
+            "max phase jump=$maxPhaseJump turns, phases=$phases, frequencies=$estimatedFrequencies",
+            maxPhaseJump <= 0.04,
+        )
+    }
+
+    @Test
+    fun frequenciesAboveLowAssistRangeStayOnCorrscopePeriodEstimate() {
+        for (frequency in listOf(80f, 100f, 120f, 150f, 220f, 440f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val estimatedFrequencies = ArrayList<Float>()
+
+            repeat(24) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val result = engine.process(
+                    sineFrame(globalBase, frequency, size = 4_800),
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 8) estimatedFrequencies += result.freqHz
+            }
+
+            assertTrue(
+                "expected=$frequency frequencies=$estimatedFrequencies",
+                estimatedFrequencies.all { abs(it - frequency) <= frequency * 0.05f },
+            )
+        }
+    }
+
+    @Test
+    fun switchingFromLowToHighFrequencyReleasesAssistImmediately() {
+        val engine = SimpleTriggerEngine()
+        val samplesPerFrame = (sampleRate / 60f).roundToInt()
+        var globalBase = 0L
+
+        repeat(16) {
+            val result = engine.process(
+                sineFrame(globalBase, 30f, size = 4_800),
+                config(globalBase).copy(displayWindowSamples = 2_400),
+            )
+            assertTrue(result.locked)
+            globalBase += samplesPerFrame
+        }
+
+        val highFrequencyResults = ArrayList<Float>()
+        repeat(4) {
+            val result = engine.process(
+                sineFrame(globalBase, 150f, size = 4_800),
+                config(globalBase).copy(displayWindowSamples = 2_400),
+            )
+            assertTrue(result.locked)
+            highFrequencyResults += result.freqHz
+            globalBase += samplesPerFrame
+        }
+
+        assertTrue(
+            "high-frequency estimates=$highFrequencyResults",
+            highFrequencyResults.drop(1).all { abs(it - 150f) <= 8f },
+        )
     }
 
     @Test
@@ -128,6 +222,158 @@ class SimpleTriggerEngineTest {
         }
     }
 
+    @Test
+    fun lowFrequencyAsyncSpwmTracksFundamentalPhase() {
+        for (frequency in listOf(20f, 30f, 40f, 50f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val fundamentalPeriod = (sampleRate / frequency).roundToInt()
+            val phases = ArrayList<Int>()
+
+            repeat(36) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val source = spwmLineFrame(
+                    globalBase = globalBase,
+                    frequency = frequency,
+                    size = 4_800,
+                    carrierMultiple = 17.35,
+                )
+                val result = engine.process(
+                    source,
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 8) {
+                    phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
+                }
+            }
+
+            val reference = phases.sorted()[phases.size / 2]
+            val maxPhaseJump = phases.maxOf { phase ->
+                val direct = abs(phase - reference)
+                minOf(direct, fundamentalPeriod - direct)
+            }
+            assertTrue(
+                "frequency=$frequency max phase jump=$maxPhaseJump samples, phases=$phases",
+                maxPhaseJump <= (sampleRate * 0.0015f).roundToInt(),
+            )
+        }
+    }
+
+    @Test
+    fun weakLowFundamentalDoesNotJumpToDominantHarmonicPhase() {
+        val frequency = 18f
+        val engine = SimpleTriggerEngine()
+        val samplesPerFrame = (sampleRate / 60f).roundToInt()
+        val fundamentalPeriod = (sampleRate / frequency).roundToInt()
+        val phases = ArrayList<Int>()
+        val estimatedFrequencies = ArrayList<Float>()
+
+        repeat(40) { frame ->
+            val globalBase = frame.toLong() * samplesPerFrame
+            val source = driftingHarmonicFrame(
+                globalBase = globalBase,
+                frequency = frequency,
+                size = 4_800,
+                frame = frame,
+            )
+            val result = engine.process(
+                source,
+                config(globalBase).copy(displayWindowSamples = 2_400),
+            )
+            assertTrue("frame=$frame did not lock", result.locked)
+            if (frame >= 8) {
+                phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
+                estimatedFrequencies += result.freqHz
+            }
+        }
+
+        val reference = phases.sorted()[phases.size / 2]
+        val maxPhaseJump = phases.maxOf { phase ->
+            val direct = abs(phase - reference)
+            minOf(direct, fundamentalPeriod - direct)
+        }
+        assertTrue(
+            "max phase jump=$maxPhaseJump samples, phases=$phases, frequencies=$estimatedFrequencies",
+            maxPhaseJump <= (fundamentalPeriod * 0.10f).roundToInt(),
+        )
+        assertTrue(
+            "expected=$frequency frequencies=$estimatedFrequencies",
+            estimatedFrequencies.all { abs(it - frequency) <= 2f },
+        )
+    }
+
+    @Test
+    fun lowFrequencySweepReleasesStalePhasePrediction() {
+        val engine = SimpleTriggerEngine()
+        val samplesPerFrame = (sampleRate / 60f).roundToInt()
+        val phaseErrors = ArrayList<Double>()
+        val estimatedFrequencies = ArrayList<Float>()
+
+        repeat(64) { frame ->
+            val globalBase = frame.toLong() * samplesPerFrame
+            val source = sweptHarmonicFrame(globalBase = globalBase, size = 4_800)
+            val result = engine.process(
+                source,
+                config(globalBase).copy(displayWindowSamples = 2_400),
+            )
+            assertTrue("frame=$frame did not lock", result.locked)
+            if (frame >= 8) {
+                val globalAnchor = globalBase + result.anchorIndex
+                phaseErrors += risingPhaseErrorRatio(sweptFundamentalPhase(globalAnchor))
+                estimatedFrequencies += result.freqHz
+            }
+        }
+
+        val maxPhaseError = phaseErrors.maxOrNull() ?: 1.0
+        assertTrue(
+            "max phase error=$maxPhaseError, errors=$phaseErrors, frequencies=$estimatedFrequencies",
+            maxPhaseError <= 0.03,
+        )
+    }
+
+    @Test
+    fun varyingCarrierLevelDoesNotToggleAwayFromLowFundamental() {
+        val frequency = 30f
+        val engine = SimpleTriggerEngine()
+        val samplesPerFrame = (sampleRate / 60f).roundToInt()
+        val fundamentalPeriod = (sampleRate / frequency).roundToInt()
+        val phases = ArrayList<Int>()
+        val estimatedFrequencies = ArrayList<Float>()
+
+        repeat(96) { frame ->
+            val globalBase = frame.toLong() * samplesPerFrame
+            val source = varyingCarrierFrame(
+                globalBase = globalBase,
+                frequency = frequency,
+                size = 4_800,
+            )
+            val result = engine.process(
+                source,
+                config(globalBase).copy(displayWindowSamples = 2_400),
+            )
+            assertTrue("frame=$frame did not lock", result.locked)
+            if (frame >= 8) {
+                phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
+                estimatedFrequencies += result.freqHz
+            }
+        }
+
+        val reference = phases.sorted()[phases.size / 2]
+        val maxPhaseJump = phases.maxOf { phase ->
+            val direct = abs(phase - reference)
+            minOf(direct, fundamentalPeriod - direct)
+        }
+        assertTrue(
+            "max phase jump=$maxPhaseJump, phases=$phases, frequencies=$estimatedFrequencies",
+            maxPhaseJump <= (fundamentalPeriod * 0.08f).roundToInt(),
+        )
+        assertTrue(
+            "expected=$frequency frequencies=$estimatedFrequencies",
+            estimatedFrequencies.all { abs(it - frequency) <= 3f },
+        )
+    }
+
     private fun config(globalBase: Long) = SimpleTriggerEngine.Config(
         mode = SimpleTriggerEngine.Mode.RISING,
         sampleRateHz = sampleRate,
@@ -143,14 +389,35 @@ class SimpleTriggerEngineTest {
         sin(2.0 * PI * frequency * (globalBase + index) / sampleRate).toFloat()
     }
 
-    private fun spwmLineFrame(
+    private fun highFrequencyHarmonicFrame(
         globalBase: Long,
         frequency: Float,
         size: Int,
     ): FloatArray = FloatArray(size) { index ->
         val sample = globalBase + index
+        val phase = 2.0 * PI * frequency * sample / sampleRate
+        (
+            0.12 * sin(phase) +
+                0.52 * sin(5.0 * phase + 0.35) +
+                0.18 * sin(7.0 * phase - 0.70)
+            ).toFloat()
+    }
+
+    private fun phaseFraction(sample: Long, frequency: Float): Double {
+        val turns = frequency.toDouble() * sample / sampleRate
+        return turns - floor(turns)
+    }
+
+    private fun spwmLineFrame(
+        globalBase: Long,
+        frequency: Float,
+        size: Int,
+        carrierMultiple: Double = 18.0,
+    ): FloatArray = FloatArray(size) { index ->
+        val sample = globalBase + index
         val fundamentalPhase = 2.0 * PI * frequency * sample / sampleRate
-        val carrierPhase = ((sample * frequency * 18.0 / sampleRate) % 1.0 + 1.0) % 1.0
+        val carrierPhase =
+            ((sample * frequency * carrierMultiple / sampleRate) % 1.0 + 1.0) % 1.0
         val carrier = 4.0 * abs(carrierPhase - 0.5) - 1.0
         val u = if (0.55 * sin(fundamentalPhase) > carrier) 1f else 0f
         val v = if (0.55 * sin(fundamentalPhase - 2.0 * PI / 3.0) > carrier) 1f else 0f
@@ -160,6 +427,67 @@ class SimpleTriggerEngineTest {
     private fun floorMod(value: Long, modulus: Int): Int {
         val result = (value % modulus).toInt()
         return if (result >= 0) result else result + modulus
+    }
+
+    private fun driftingHarmonicFrame(
+        globalBase: Long,
+        frequency: Float,
+        size: Int,
+        frame: Int,
+    ): FloatArray = FloatArray(size) { index ->
+        val sample = globalBase + index
+        val phase = 2.0 * PI * frequency * sample / sampleRate - PI / 2.0
+        val shapeDrift = frame * 0.11
+        (
+            0.08 * sin(phase) +
+                0.34 * sin(5.0 * phase + shapeDrift) +
+                0.15 * sin(7.0 * phase - shapeDrift * 0.6) +
+                0.07 * sin(9.0 * phase + shapeDrift * 0.35)
+            ).toFloat()
+    }
+
+    private fun sweptHarmonicFrame(
+        globalBase: Long,
+        size: Int,
+    ): FloatArray = FloatArray(size) { index ->
+        val sample = globalBase + index
+        val phase = sweptFundamentalPhase(sample)
+        val t = sample / sampleRate.toDouble()
+        val shapeDrift = 0.45 * sin(2.0 * PI * 0.7 * t)
+        (
+            0.12 * sin(phase) +
+                0.28 * sin(5.0 * phase + shapeDrift) +
+                0.13 * sin(7.0 * phase - shapeDrift * 0.5) +
+                0.05 * sin(9.0 * phase + shapeDrift * 0.25)
+            ).toFloat()
+    }
+
+    private fun sweptFundamentalPhase(sample: Long): Double {
+        val t = sample / sampleRate.toDouble()
+        val startHz = 15.0
+        val sweepHzPerSecond = 32.0
+        return 2.0 * PI * (startHz * t + 0.5 * sweepHzPerSecond * t * t) - PI / 2.0
+    }
+
+    private fun risingPhaseErrorRatio(phase: Double): Double {
+        val turns = phase / (2.0 * PI)
+        val fraction = turns - floor(turns)
+        return minOf(fraction, 1.0 - fraction)
+    }
+
+    private fun varyingCarrierFrame(
+        globalBase: Long,
+        frequency: Float,
+        size: Int,
+    ): FloatArray = FloatArray(size) { index ->
+        val sample = globalBase + index
+        val t = sample / sampleRate.toDouble()
+        val fundamentalPhase = 2.0 * PI * frequency * t
+        val carrierAmplitude = 0.05 + 0.90 * (0.5 + 0.5 * sin(2.0 * PI * 1.1 * t))
+        (
+            0.08 * sin(fundamentalPhase) +
+                carrierAmplitude * sin(2.0 * PI * 617.0 * t + 0.35)
+            ).toFloat()
     }
 
     private fun assertEdgeAtDisplayReference(

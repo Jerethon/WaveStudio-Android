@@ -18,7 +18,7 @@ internal object Autocorrelation {
      * @param maxLag maximum lag (output length)
      * @param out output buffer of size >= maxLag
      *
-     * Output is normalized to roughly [-1, 1] (by energy at lag 0).
+     * Output is normalized to roughly [-1, 1] using each lag's overlapping-pair energy.
      */
     fun computeNormalized(
         x: FloatArray,
@@ -38,27 +38,25 @@ internal object Autocorrelation {
         for (i in 0 until n) sum += x[start + i]
         val mean = sum / n
 
-        // Energy
-        var e0 = 0f
-        for (i in 0 until n) {
-            val v = x[start + i] - mean
-            e0 += v * v
-        }
-        e0 = max(e0, 1e-6f)
-
         val lagMax = maxLag.coerceAtMost(n - 1)
         for (lag in 0 until lagMax) {
             var acc = 0f
+            var energyA = 0f
+            var energyB = 0f
             var i = 0
             val end = n - lag
             while (i < end) {
                 val a = x[start + i] - mean
                 val b = x[start + i + lag] - mean
                 acc += a * b
+                energyA += a * a
+                energyB += b * b
                 i++
             }
-            // Normalize by lag-0 energy approximation
-            out[lag] = (acc / e0).coerceIn(-1f, 1f)
+            // Normalize each overlapping pair independently. Dividing every lag by the
+            // lag-0 energy unfairly suppresses long periods and lets strong harmonics win.
+            val denom = kotlin.math.sqrt(energyA * energyB).coerceAtLeast(1e-6f)
+            out[lag] = (acc / denom).coerceIn(-1f, 1f)
         }
         for (lag in lagMax until maxLag) out[lag] = 0f
 
@@ -122,23 +120,45 @@ internal object Autocorrelation {
         var bestScore = Float.NEGATIVE_INFINITY
         val seeded = seedLag in lagMin..lagMax
 
-        // ignore lag 0; scan for peaks
-        for (lag in lagMin..lagMax) {
+        fun peakScore(lag: Int): Float {
             val v = ac[lag]
-            if (v <= 0f) continue
-            // local maximum
-            val isPeak = v >= ac[lag - 1] && v >= ac[lag + 1]
-            if (!isPeak) continue
-
             val proximityBonus = if (seeded) {
                 val dist = abs(lag - seedLag).toFloat()
                 0.20f * (1f - (dist / seedLag.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f))
-            } else 0f
+            } else {
+                0f
+            }
             val harmonicPenalty = if (seeded && lag < seedLag * 0.75f) 0.12f else 0f
-            val score = v + proximityBonus - harmonicPenalty
+            return v + proximityBonus - harmonicPenalty
+        }
+
+        // Ignore lag 0; first find the strongest local peak.
+        for (lag in lagMin..lagMax) {
+            val v = ac[lag]
+            if (v <= 0f) continue
+            val isPeak = v >= ac[lag - 1] && v >= ac[lag + 1]
+            if (!isPeak) continue
+
+            val score = peakScore(lag)
             if (score > bestScore) {
                 bestScore = score
                 bestLag = lag
+            }
+        }
+
+        // A clean periodic signal has almost identical peaks at 1×, 2×, ... its period.
+        // Prefer the earliest peak within a tight margin of the maximum so those multiples
+        // are not mistaken for a lower fundamental.
+        if (bestLag > 0) {
+            val nearBestFloor = bestScore - 0.01f
+            for (lag in lagMin until bestLag) {
+                val v = ac[lag]
+                if (v <= 0f || v < 0.15f) continue
+                val isPeak = v >= ac[lag - 1] && v >= ac[lag + 1]
+                if (isPeak && peakScore(lag) >= nearBestFloor) {
+                    bestLag = lag
+                    break
+                }
             }
         }
 

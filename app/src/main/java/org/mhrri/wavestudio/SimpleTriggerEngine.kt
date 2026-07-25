@@ -68,12 +68,16 @@ internal class SimpleTriggerEngine(
         lastGlobalBase = config.globalBase
         processFrame++
 
+        prepareLowFrequencyAssist(signal, config.sampleRateHz)
+        updatePeriodEstimate(signal, config.sampleRateHz)
+        val lowFrequencyMode = usingLowFrequencyAssist
+        val triggerSignal = if (lowFrequencyMode) periodAssistBuffer else signal
         val isRising = config.mode == Mode.RISING
-        val signalRms = rms(signal)
+        val signalRms = rms(triggerSignal)
         val threshold = max(abs(config.triggerThreshold), signalRms * 0.10f)
         val hysteresis = max(0.002f, max(threshold * 0.18f, signalRms * 0.06f))
         val crossings = detectCrossings(
-            signal = signal,
+            signal = triggerSignal,
             threshold = threshold,
             hysteresis = hysteresis,
             rising = isRising,
@@ -83,8 +87,6 @@ internal class SimpleTriggerEngine(
         if (crossings.isEmpty() || signalRms < 0.001f) {
             return unlockedFallback(n, config)
         }
-
-        updatePeriodEstimate(signal, config.sampleRateHz)
 
         val displaySamples = config.displayWindowSamples.coerceIn(64, n)
         val preSamples = (displaySamples * config.preTriggerRatio.coerceIn(0.05f, 0.45f))
@@ -97,6 +99,47 @@ internal class SimpleTriggerEngine(
         } else {
             max(kernelSize, displaySamples / 2)
         }.coerceIn(kernelHalf, max(kernelHalf, n / 2))
+        // CorrScope's correlation scoring is already strong at normal frequencies. Global
+        // phase prediction is only needed for the low-frequency assisted waveform, where a
+        // display frame may contain less than one fundamental cycle.
+        val predictedAnchor = if (lowFrequencyMode) {
+            predictedLocalAnchor(
+                globalBase = config.globalBase,
+                preferredAnchor = preferredAnchor,
+                periodSamples = estimatedPeriodSamples,
+            )
+        } else {
+            -1
+        }
+        val predictionRadius = if (predictedAnchor >= 0 && estimatedPeriodSamples > 0) {
+            max(8, (estimatedPeriodSamples * 0.14f).roundToInt())
+        } else {
+            0
+        }
+
+        val candidateAnchors = crossings.asSequence()
+            .map { crossing ->
+                refineZeroCrossing(
+                    signal = triggerSignal,
+                    center = crossing,
+                    rising = isRising,
+                    periodSamples = estimatedPeriodSamples,
+                )
+            }
+            .filter { anchor ->
+                anchor >= kernelHalf &&
+                    anchor + kernelHalf <= n &&
+                    anchor <= preferredAnchor
+            }
+            .distinct()
+            .toList()
+        val phaseScopedAnchors = if (predictedAnchor >= 0) {
+            candidateAnchors.filter { abs(it - predictedAnchor) <= predictionRadius }
+        } else {
+            emptyList()
+        }
+        val anchorsToScore =
+            if (phaseScopedAnchors.isNotEmpty()) phaseScopedAnchors else candidateAnchors
 
         var bestAnchor = -1
         var bestScore = Float.NEGATIVE_INFINITY
@@ -104,40 +147,51 @@ internal class SimpleTriggerEngine(
         var foundInRadius = false
 
         fun scoreCandidates(limitToRadius: Boolean) {
-            for (crossing in crossings) {
-                val anchor = refineZeroCrossing(
-                    signal = signal,
-                    center = crossing,
-                    rising = isRising,
-                    periodSamples = estimatedPeriodSamples,
-                )
-                if (anchor < kernelHalf || anchor + kernelHalf > n) continue
-                // The chosen edge must leave enough samples on its right for the
-                // requested display window. Otherwise extractWindow() clamps its
-                // start and the trigger edge no longer lands at preTriggerRatio.
-                if (anchor > preferredAnchor) continue
+            for (anchor in anchorsToScore) {
                 val distance = abs(anchor - preferredAnchor)
                 if (limitToRadius && distance > searchRadius) continue
 
                 foundInRadius = foundInRadius || limitToRadius
                 val edgeScore = edgeScore(
-                    signal,
+                    triggerSignal,
                     anchor,
                     isRising,
                     estimatedPeriodSamples,
                     signalRms,
                 )
                 val corrScore = if (bufferInitialized) {
-                    normalizedWindowCorrelation(signal, anchor)
+                    normalizedWindowCorrelation(triggerSignal, anchor)
                 } else {
                     0f
                 }
                 val distanceScale = max(estimatedPeriodSamples, kernelSize).toFloat()
                 val proximityPenalty = 0.08f * (distance / distanceScale).coerceAtMost(2f)
-                val score = if (bufferInitialized) {
-                    corrScore + edgeScore * 0.30f - proximityPenalty
+                val predictionScore = if (predictedAnchor >= 0 && predictionRadius > 0) {
+                    val error = abs(anchor - predictedAnchor).toFloat()
+                    val sigma = max(1f, estimatedPeriodSamples * 0.14f)
+                    exp(-0.5f * (error / sigma) * (error / sigma))
                 } else {
-                    edgeScore - proximityPenalty
+                    0f
+                }
+                val score = if (lowFrequencyMode) {
+                    if (bufferInitialized) {
+                        corrScore * 0.55f +
+                            edgeScore * 0.22f +
+                            predictionScore * 0.72f -
+                            proximityPenalty
+                    } else {
+                        edgeScore * 0.30f +
+                            predictionScore * 0.72f -
+                            proximityPenalty
+                    }
+                } else {
+                    // Preserve CorrScope-style behavior outside the low-frequency assist:
+                    // waveform similarity leads, while edge strength only helps acquisition.
+                    if (bufferInitialized) {
+                        corrScore + edgeScore * 0.30f - proximityPenalty
+                    } else {
+                        edgeScore - proximityPenalty
+                    }
                 }
                 if (score > bestScore) {
                     bestScore = score
@@ -159,7 +213,7 @@ internal class SimpleTriggerEngine(
         } else {
             0.5f
         }
-        updateCorrelationBuffer(signal, bestAnchor)
+        updateCorrelationBuffer(triggerSignal, bestAnchor)
         lastTriggerGlobalIdx = config.globalBase + bestAnchor
 
         val period = estimatedPeriodSamples.coerceAtLeast(0)
@@ -172,6 +226,22 @@ internal class SimpleTriggerEngine(
             mode = config.mode,
             freqHz = frequency,
         )
+    }
+
+    private fun predictedLocalAnchor(
+        globalBase: Long,
+        preferredAnchor: Int,
+        periodSamples: Int,
+    ): Int {
+        if (lastTriggerGlobalIdx == Long.MIN_VALUE || periodSamples <= 0) return -1
+        val period = periodSamples.toLong()
+        val preferredGlobal = globalBase + preferredAnchor
+        val delta = preferredGlobal - lastTriggerGlobalIdx
+        val cycles = Math.floorDiv(delta, period)
+        val predictedGlobal = lastTriggerGlobalIdx + cycles * period
+        return (predictedGlobal - globalBase)
+            .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())
+            .toInt()
     }
 
     fun seekAnchorTo(localAnchor: Int) {
@@ -202,7 +272,11 @@ internal class SimpleTriggerEngine(
     }
 
     private fun updatePeriodEstimate(signal: FloatArray, sampleRateHz: Float) {
-        if (processFrame != 1 && processFrame % 8 != 0) return
+        val scheduledUpdate = processFrame == 1 || processFrame % 8 == 0
+        val shouldReleaseLowAssist = usingLowFrequencyAssist &&
+            assistedCrossingFrequencyHz(sampleRateHz) >
+            LOW_FREQUENCY_ASSIST_EXIT_HZ * LOW_FREQUENCY_FAST_EXIT_RATIO
+        if (!scheduledUpdate && !shouldReleaseLowAssist) return
 
         val downsample = 2
         val sourceCount = min(signal.size, 8192)
@@ -210,32 +284,17 @@ internal class SimpleTriggerEngine(
         val count = sourceCount / downsample
         if (count < 64) return
         if (autocorrInput.size < count) autocorrInput = FloatArray(count)
-        if (periodAssistBuffer.size < sourceCount) {
-            periodAssistBuffer = FloatArray(sourceCount)
-        }
 
-        // PWM and harmonic-rich signals often have a much stronger carrier peak than their
-        // fundamental. A short 3-pole low-pass isolates low-frequency energy before deciding
-        // whether the 10–100 Hz period estimate should take precedence.
-        val assistCutoffHz = min(120f, sampleRateHz * 0.20f)
-        val alpha = (1.0 - exp(-2.0 * Math.PI * assistCutoffHz / sampleRateHz))
-            .toFloat()
-            .coerceIn(0.001f, 1f)
-        var stage1 = signal[sourceStart]
-        var stage2 = stage1
-        var stage3 = stage2
         var rawEnergy = 0f
         var assistEnergy = 0f
         val energyStart = sourceCount / 4
+        val energyEnd = sourceCount - energyStart
         for (i in 0 until sourceCount) {
             val sample = signal[sourceStart + i]
-            stage1 += alpha * (sample - stage1)
-            stage2 += alpha * (stage1 - stage2)
-            stage3 += alpha * (stage2 - stage3)
-            periodAssistBuffer[i] = stage3
-            if (i >= energyStart) {
+            if (i in energyStart until energyEnd) {
                 rawEnergy += sample * sample
-                assistEnergy += stage3 * stage3
+                val assisted = periodAssistBuffer[sourceStart + i]
+                assistEnergy += assisted * assisted
             }
         }
 
@@ -245,22 +304,34 @@ internal class SimpleTriggerEngine(
         )
         var lag = 0
         var usedLowFrequencyAssist = false
-        if (lowFrequencyEnergyRatio >= 0.10f) {
+        val lowFrequencyAssistThreshold =
+            if (usingLowFrequencyAssist) 0.02f else 0.04f
+        if (lowFrequencyEnergyRatio >= lowFrequencyAssistThreshold) {
             for (i in 0 until count) {
-                autocorrInput[i] = periodAssistBuffer[i * downsample]
+                autocorrInput[i] = periodAssistBuffer[sourceStart + i * downsample]
             }
-            lag = estimatePreparedPeriod(
+            val assistedLag = estimatePreparedPeriod(
                 count = count,
                 effectiveRate = effectiveRate,
                 fMinHz = 10f,
-                fMaxHz = 100f,
-                seedLag = if (usingLowFrequencyAssist && estimatedPeriodSamples > 0) {
-                    estimatedPeriodSamples / downsample
-                } else {
-                    0
-                },
+                // Probe above the assist range so a 120–150 Hz signal is identified at its
+                // true period instead of being folded to a 60–75 Hz subharmonic.
+                fMaxHz = LOW_FREQUENCY_PROBE_MAX_HZ,
+                seedLag = 0,
             )
-            usedLowFrequencyAssist = lag > 0
+            if (assistedLag > 0) {
+                val assistedFrequencyHz = effectiveRate / assistedLag
+                val assistFrequencyLimitHz =
+                    if (usingLowFrequencyAssist) {
+                        LOW_FREQUENCY_ASSIST_EXIT_HZ
+                    } else {
+                        LOW_FREQUENCY_ASSIST_ENTER_HZ
+                    }
+                if (assistedFrequencyHz <= assistFrequencyLimitHz) {
+                    lag = assistedLag
+                    usedLowFrequencyAssist = true
+                }
+            }
         }
 
         if (lag <= 0) {
@@ -282,13 +353,64 @@ internal class SimpleTriggerEngine(
 
         if (lag > 0) {
             val candidate = lag * downsample
+            val estimatorChanged = usedLowFrequencyAssist != usingLowFrequencyAssist
             estimatedPeriodSamples =
-                if (estimatedPeriodSamples > 0 && usedLowFrequencyAssist == usingLowFrequencyAssist) {
-                    (estimatedPeriodSamples * 0.75f + candidate * 0.25f).roundToInt()
+                if (estimatedPeriodSamples > 0 && !estimatorChanged) {
+                    if (usedLowFrequencyAssist) {
+                        val ratio = candidate.toFloat() / estimatedPeriodSamples
+                        if (ratio in 0.70f..1.30f) {
+                            (estimatedPeriodSamples * 0.82f + candidate * 0.18f).roundToInt()
+                        } else {
+                            estimatedPeriodSamples
+                        }
+                    } else {
+                        // Normal frequencies keep CorrScope's quicker period response.
+                        (estimatedPeriodSamples * 0.75f + candidate * 0.25f).roundToInt()
+                    }
                 } else {
                     candidate
                 }
             usingLowFrequencyAssist = usedLowFrequencyAssist
+            if (estimatorChanged) {
+                correlationBuffer.fill(0f)
+                bufferInitialized = false
+            }
+        }
+    }
+
+    private fun prepareLowFrequencyAssist(signal: FloatArray, sampleRateHz: Float) {
+        if (periodAssistBuffer.size != signal.size) {
+            periodAssistBuffer = FloatArray(signal.size)
+        }
+        if (signal.isEmpty()) return
+
+        // Forward/backward filtering removes the phase delay of a causal low-pass. This lets
+        // the assisted trigger choose the fundamental edge without shifting the displayed
+        // waveform horizontally.
+        val assistCutoffHz = min(120f, sampleRateHz * 0.20f)
+        val alpha = (1.0 - exp(-2.0 * Math.PI * assistCutoffHz / sampleRateHz))
+            .toFloat()
+            .coerceIn(0.001f, 1f)
+        var stage1 = signal[0]
+        var stage2 = stage1
+        var stage3 = stage2
+        for (i in signal.indices) {
+            val sample = signal[i]
+            stage1 += alpha * (sample - stage1)
+            stage2 += alpha * (stage1 - stage2)
+            stage3 += alpha * (stage2 - stage3)
+            periodAssistBuffer[i] = stage3
+        }
+
+        stage1 = periodAssistBuffer.last()
+        stage2 = stage1
+        stage3 = stage2
+        for (i in periodAssistBuffer.lastIndex downTo 0) {
+            val sample = periodAssistBuffer[i]
+            stage1 += alpha * (sample - stage1)
+            stage2 += alpha * (stage1 - stage2)
+            stage3 += alpha * (stage2 - stage3)
+            periodAssistBuffer[i] = stage3
         }
     }
 
@@ -299,7 +421,10 @@ internal class SimpleTriggerEngine(
         fMaxHz: Float,
         seedLag: Int,
     ): Int {
-        val maxLag = min(count - 1, (effectiveRate / fMinHz).roundToInt())
+        // Pair-energy normalization becomes unreliable when only a handful of samples
+        // overlap at very long lags. Keep at least a quarter of the input in every pair.
+        val minimumOverlap = max(64, count / 4)
+        val maxLag = min(count - minimumOverlap, (effectiveRate / fMinHz).roundToInt())
         if (maxLag < 16) return 0
         if (autocorrOutput.size < maxLag + 1) {
             autocorrOutput = FloatArray(maxLag + 1)
@@ -320,6 +445,30 @@ internal class SimpleTriggerEngine(
             seedLag = seedLag,
         )
         return lag
+    }
+
+    private fun assistedCrossingFrequencyHz(sampleRateHz: Float): Float {
+        if (periodAssistBuffer.size < 8 || sampleRateHz <= 0f) return 0f
+        val start = periodAssistBuffer.size / 4
+        val endExclusive = periodAssistBuffer.size - start
+        if (endExclusive - start < 4) return 0f
+
+        var mean = 0f
+        for (i in start until endExclusive) mean += periodAssistBuffer[i]
+        mean /= (endExclusive - start)
+
+        var firstCrossing = -1
+        var lastCrossing = -1
+        var crossingCount = 0
+        for (i in start + 1 until endExclusive) {
+            if (periodAssistBuffer[i - 1] < mean && periodAssistBuffer[i] >= mean) {
+                if (firstCrossing < 0) firstCrossing = i
+                lastCrossing = i
+                crossingCount++
+            }
+        }
+        if (crossingCount < 3 || lastCrossing <= firstCrossing) return 0f
+        return (crossingCount - 1) * sampleRateHz / (lastCrossing - firstCrossing)
     }
 
     private fun normalizedWindowCorrelation(signal: FloatArray, anchor: Int): Float {
@@ -502,5 +651,12 @@ internal class SimpleTriggerEngine(
         estimatedPeriodSamples = 0
         processFrame = 0
         usingLowFrequencyAssist = false
+    }
+
+    private companion object {
+        const val LOW_FREQUENCY_ASSIST_ENTER_HZ = 70f
+        const val LOW_FREQUENCY_ASSIST_EXIT_HZ = 85f
+        const val LOW_FREQUENCY_FAST_EXIT_RATIO = 1.10f
+        const val LOW_FREQUENCY_PROBE_MAX_HZ = 240f
     }
 }

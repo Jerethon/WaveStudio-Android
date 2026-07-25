@@ -725,6 +725,8 @@ internal fun AboutDialog(
     val websiteRedirectMsg = stringResource(R.string.about_website_redirect_confirm, aboutWebsiteUrl)
 
     val aboutSections = listOf(
+        "0.18.1" to R.array.about_changelog_v0181,
+        "0.18.0" to R.array.about_changelog_v0180,
         "0.17.0" to R.array.about_changelog_v0170,
         "0.16.1" to R.array.about_changelog_v0161,
         "0.16.0" to R.array.about_changelog_v0160,
