@@ -99,6 +99,253 @@ class SimpleTriggerEngineTest {
     }
 
     @Test
+    fun aboveFortyHertzHarmonicWaveformsKeepCorrelationPhase() {
+        for (frequency in listOf(50f, 60f, 80f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val phases = ArrayList<Double>()
+
+            repeat(48) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val source = highFrequencyHarmonicFrame(
+                    globalBase = globalBase,
+                    frequency = frequency,
+                    size = 4_800,
+                )
+                val result = engine.process(
+                    source,
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 24) {
+                    phases += phaseFraction(globalBase + result.anchorIndex, frequency)
+                }
+            }
+
+            val reference = phases.first()
+            val maxPhaseJump = phases.maxOf { phase ->
+                val direct = abs(phase - reference)
+                minOf(direct, 1.0 - direct)
+            }
+            assertTrue(
+                "frequency=$frequency max phase jump=$maxPhaseJump turns, phases=$phases",
+                maxPhaseJump <= 0.04,
+            )
+        }
+    }
+
+    @Test
+    fun corrScopeDominantRangeSuppressesSmallRandomHorizontalJitter() {
+        for (frequency in listOf(50f, 60f, 120f, 240f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val fundamentalPeriod = (sampleRate / frequency).roundToInt()
+            val phases = ArrayList<Int>()
+            val weights = ArrayList<Float>()
+            val periods = ArrayList<Int>()
+
+            repeat(96) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val result = engine.process(
+                    noisyHarmonicFrame(globalBase, frequency, size = 4_800),
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 16) {
+                    phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
+                    weights += result.corrScopeWeight
+                    periods += result.periodSamples
+                }
+            }
+
+            val reference = phases.sorted()[phases.size / 2]
+            val maximumJitter = phases.maxOf { phase ->
+                val direct = abs(phase - reference)
+                minOf(direct, fundamentalPeriod - direct)
+            }
+            assertTrue(
+                "frequency=$frequency jitter=$maximumJitter phases=$phases " +
+                    "weights=$weights periods=$periods",
+                maximumJitter <= 3,
+            )
+            if (frequency >= 60f) {
+                assertTrue(
+                    "frequency=$frequency average weight=${weights.average()} weights=$weights",
+                    weights.average() >= 0.65,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun midFrequencyAsyncSpwmKeepsFundamentalPhaseSteady() {
+        for (frequency in listOf(50f, 45f, 40f, 35f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val fundamentalPeriod = (sampleRate / frequency).roundToInt()
+            val phases = ArrayList<Int>()
+            val weights = ArrayList<Float>()
+            val periods = ArrayList<Int>()
+
+            repeat(72) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val result = engine.process(
+                    spwmLineFrame(
+                        globalBase = globalBase,
+                        frequency = frequency,
+                        size = 4_800,
+                        carrierMultiple = 17.35,
+                    ),
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 16) {
+                    phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
+                    weights += result.corrScopeWeight
+                    periods += result.periodSamples
+                }
+            }
+
+            val reference = phases.sorted()[phases.size / 2]
+            val maximumJitter = phases.maxOf { phase ->
+                val direct = abs(phase - reference)
+                minOf(direct, fundamentalPeriod - direct)
+            }
+            assertTrue(
+                "frequency=$frequency jitter=$maximumJitter phases=$phases " +
+                    "weights=$weights periods=$periods",
+                maximumJitter <= 10,
+            )
+        }
+    }
+
+    @Test
+    fun corrScopeDominantAsyncSpwmKeepsRawWindowContinuity() {
+        val measuredCorrelations = LinkedHashMap<Float, Double>()
+        for (frequency in listOf(55f, 60f, 65f, 70f, 80f, 120f, 180f, 240f, 300f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val correlations = ArrayList<Float>()
+            val estimatedFrequencies = ArrayList<Float>()
+            var previousWindow: FloatArray? = null
+
+            repeat(72) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val source = spwmLineFrame(
+                    globalBase = globalBase,
+                    frequency = frequency,
+                    size = 4_800,
+                    carrierMultiple = 17.35,
+                )
+                val result = engine.process(
+                    source,
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 16) {
+                    estimatedFrequencies += result.freqHz
+                    val window = engine.extractWindow(source, result, 512, 0.20f)
+                    previousWindow?.let { previous ->
+                        correlations += normalizedCorrelation(previous, window)
+                    }
+                    previousWindow = window
+                }
+            }
+
+            val averageCorrelation = correlations.average()
+            measuredCorrelations[frequency] = averageCorrelation
+            assertTrue(
+                "frequency=$frequency estimated=$estimatedFrequencies",
+                estimatedFrequencies.all {
+                    abs(it - frequency) <= maxOf(2f, frequency * 0.05f)
+                },
+            )
+        }
+        assertTrue(
+            "average correlations=$measuredCorrelations",
+            measuredCorrelations.all { (frequency, correlation) ->
+                val minimumCorrelation = if (frequency < 70f) 0.55 else 0.70
+                correlation >= minimumCorrelation
+            },
+        )
+    }
+
+    @Test
+    fun midFrequencyThresholdChatterKeepsTheSamePhaseCandidate() {
+        for (frequency in listOf(40f, 45f, 50f, 55f)) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val phases = ArrayList<Double>()
+
+            repeat(72) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val phaseOffset = frame * 0.10
+                val result = engine.process(
+                    midFrequencyChatterFrame(
+                        globalBase = globalBase,
+                        frequency = frequency,
+                        size = 4_800,
+                        phaseOffset = phaseOffset,
+                        frame = frame,
+                    ),
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 16) {
+                    val turns =
+                        frequency * (globalBase + result.anchorIndex) / sampleRate +
+                            phaseOffset / (2.0 * PI)
+                    phases += turns - floor(turns)
+                }
+            }
+
+            val reference = phases.sorted()[phases.size / 2]
+            val maximumPhaseJump = phases.maxOf { phase ->
+                val direct = abs(phase - reference)
+                minOf(direct, 1.0 - direct)
+            }
+            assertTrue(
+                "frequency=$frequency maxPhaseJump=$maximumPhaseJump phases=$phases",
+                maximumPhaseJump <= 0.02,
+            )
+        }
+    }
+
+    @Test
+    fun corrScopeWeightFollowsPreferredFortyToSixtyFiveHertzTransition() {
+        val expectedWeights = listOf(
+            40f to 0f,
+            50f to 0.352f,
+            55f to 0.648f,
+            60f to 0.896f,
+            65f to 1f,
+            70f to 1f,
+        )
+
+        for ((frequency, expectedWeight) in expectedWeights) {
+            val engine = SimpleTriggerEngine()
+            val samplesPerFrame = (sampleRate / 60f).roundToInt()
+            val weights = ArrayList<Float>()
+
+            repeat(48) { frame ->
+                val globalBase = frame.toLong() * samplesPerFrame
+                val result = engine.process(
+                    sineFrame(globalBase, frequency, size = 4_800),
+                    config(globalBase).copy(displayWindowSamples = 2_400),
+                )
+                assertTrue("frequency=$frequency frame=$frame did not lock", result.locked)
+                if (frame >= 24) weights += result.corrScopeWeight
+            }
+
+            val averageWeight = weights.average()
+            assertTrue(
+                "frequency=$frequency expected=$expectedWeight actual=$averageWeight weights=$weights",
+                abs(averageWeight - expectedWeight) <= 0.04,
+            )
+        }
+    }
+
+    @Test
     fun frequenciesAboveLowAssistRangeStayOnCorrscopePeriodEstimate() {
         for (frequency in listOf(80f, 100f, 120f, 150f, 220f, 440f)) {
             val engine = SimpleTriggerEngine()
@@ -268,6 +515,7 @@ class SimpleTriggerEngineTest {
         val fundamentalPeriod = (sampleRate / frequency).roundToInt()
         val phases = ArrayList<Int>()
         val estimatedFrequencies = ArrayList<Float>()
+        val adaptiveWeights = ArrayList<Float>()
 
         repeat(40) { frame ->
             val globalBase = frame.toLong() * samplesPerFrame
@@ -285,6 +533,7 @@ class SimpleTriggerEngineTest {
             if (frame >= 8) {
                 phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
                 estimatedFrequencies += result.freqHz
+                adaptiveWeights += result.corrScopeWeight
             }
         }
 
@@ -294,7 +543,8 @@ class SimpleTriggerEngineTest {
             minOf(direct, fundamentalPeriod - direct)
         }
         assertTrue(
-            "max phase jump=$maxPhaseJump samples, phases=$phases, frequencies=$estimatedFrequencies",
+            "max phase jump=$maxPhaseJump samples, phases=$phases, " +
+                "frequencies=$estimatedFrequencies, weights=$adaptiveWeights",
             maxPhaseJump <= (fundamentalPeriod * 0.10f).roundToInt(),
         )
         assertTrue(
@@ -309,6 +559,7 @@ class SimpleTriggerEngineTest {
         val samplesPerFrame = (sampleRate / 60f).roundToInt()
         val phaseErrors = ArrayList<Double>()
         val estimatedFrequencies = ArrayList<Float>()
+        val adaptiveWeights = ArrayList<Float>()
 
         repeat(64) { frame ->
             val globalBase = frame.toLong() * samplesPerFrame
@@ -322,6 +573,7 @@ class SimpleTriggerEngineTest {
                 val globalAnchor = globalBase + result.anchorIndex
                 phaseErrors += risingPhaseErrorRatio(sweptFundamentalPhase(globalAnchor))
                 estimatedFrequencies += result.freqHz
+                adaptiveWeights += result.corrScopeWeight
             }
         }
 
@@ -329,6 +581,13 @@ class SimpleTriggerEngineTest {
         assertTrue(
             "max phase error=$maxPhaseError, errors=$phaseErrors, frequencies=$estimatedFrequencies",
             maxPhaseError <= 0.03,
+        )
+        val maximumWeightStep = adaptiveWeights.zipWithNext { previous, current ->
+            abs(current - previous)
+        }.maxOrNull() ?: 0f
+        assertTrue(
+            "weight step=$maximumWeightStep weights=$adaptiveWeights",
+            maximumWeightStep <= 0.20f,
         )
     }
 
@@ -340,6 +599,7 @@ class SimpleTriggerEngineTest {
         val fundamentalPeriod = (sampleRate / frequency).roundToInt()
         val phases = ArrayList<Int>()
         val estimatedFrequencies = ArrayList<Float>()
+        val adaptiveWeights = ArrayList<Float>()
 
         repeat(96) { frame ->
             val globalBase = frame.toLong() * samplesPerFrame
@@ -356,6 +616,7 @@ class SimpleTriggerEngineTest {
             if (frame >= 8) {
                 phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
                 estimatedFrequencies += result.freqHz
+                adaptiveWeights += result.corrScopeWeight
             }
         }
 
@@ -365,7 +626,8 @@ class SimpleTriggerEngineTest {
             minOf(direct, fundamentalPeriod - direct)
         }
         assertTrue(
-            "max phase jump=$maxPhaseJump, phases=$phases, frequencies=$estimatedFrequencies",
+            "max phase jump=$maxPhaseJump, phases=$phases, frequencies=$estimatedFrequencies, " +
+                "weights=$adaptiveWeights",
             maxPhaseJump <= (fundamentalPeriod * 0.08f).roundToInt(),
         )
         assertTrue(
@@ -403,9 +665,43 @@ class SimpleTriggerEngineTest {
             ).toFloat()
     }
 
+    private fun noisyHarmonicFrame(
+        globalBase: Long,
+        frequency: Float,
+        size: Int,
+    ): FloatArray = FloatArray(size) { index ->
+        val sample = globalBase + index
+        val phase = 2.0 * PI * frequency * sample / sampleRate
+        val hash = (sample * 1_664_525L + 1_013_904_223L) xor (sample shl 11)
+        val noise = ((hash and 0xffffL) / 32767.5) - 1.0
+        (
+            0.16 * sin(phase) +
+                0.52 * sin(5.0 * phase + 0.35) +
+                0.18 * sin(7.0 * phase - 0.70) +
+                0.035 * noise
+            ).toFloat()
+    }
+
     private fun phaseFraction(sample: Long, frequency: Float): Double {
         val turns = frequency.toDouble() * sample / sampleRate
         return turns - floor(turns)
+    }
+
+    private fun normalizedCorrelation(lhs: FloatArray, rhs: FloatArray): Float {
+        val count = minOf(lhs.size, rhs.size)
+        val lhsMean = lhs.take(count).average().toFloat()
+        val rhsMean = rhs.take(count).average().toFloat()
+        var dot = 0f
+        var lhsEnergy = 0f
+        var rhsEnergy = 0f
+        for (i in 0 until count) {
+            val left = lhs[i] - lhsMean
+            val right = rhs[i] - rhsMean
+            dot += left * right
+            lhsEnergy += left * left
+            rhsEnergy += right * right
+        }
+        return dot / kotlin.math.sqrt(lhsEnergy * rhsEnergy).coerceAtLeast(1e-6f)
     }
 
     private fun spwmLineFrame(
@@ -422,6 +718,26 @@ class SimpleTriggerEngineTest {
         val u = if (0.55 * sin(fundamentalPhase) > carrier) 1f else 0f
         val v = if (0.55 * sin(fundamentalPhase - 2.0 * PI / 3.0) > carrier) 1f else 0f
         u - v
+    }
+
+    private fun midFrequencyChatterFrame(
+        globalBase: Long,
+        frequency: Float,
+        size: Int,
+        phaseOffset: Double,
+        frame: Int,
+    ): FloatArray = FloatArray(size) { index ->
+        val sample = globalBase + index
+        val t = sample / sampleRate.toDouble()
+        val phase = 2.0 * PI * frequency * t + phaseOffset
+        val chatter = 0.016 * sin(2.0 * PI * 920.0 * t + frame * 0.35)
+        (
+            0.11 * sin(phase) +
+                0.26 * sin(5.0 * phase) +
+                0.12 * sin(7.0 * phase) +
+                0.05 * sin(9.0 * phase) +
+                chatter
+            ).toFloat()
     }
 
     private fun floorMod(value: Long, modulus: Int): Int {

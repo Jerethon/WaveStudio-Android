@@ -52,6 +52,7 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.math.tan
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.AudioTrack
@@ -3209,30 +3210,36 @@ class AudioEngineViewModel(application: Application) : AndroidViewModel(applicat
 
     private fun firstOrderLowPass(input: List<Float>, sampleRate: Int, cutoffHz: Float): List<Float> {
         if (input.isEmpty()) return emptyList()
-        val dt = 1f / sampleRate
-        val rc = 1f / (2f * PI.toFloat() * cutoffHz)
-        val alpha = (dt / (rc + dt)).coerceIn(0f, 1f)
+        // Pre-warped bilinear transform of an analog RC low-pass.  This keeps
+        // the digital response at -3 dB exactly at cutoffHz for every stage.
+        val k = tustinRcK(sampleRate, cutoffHz)
+        val b = k / (1f + k)
+        val a1 = (k - 1f) / (1f + k)
 
         val out = ArrayList<Float>(input.size)
         var y = 0f
+        var xPrev = 0f
         for (x in input) {
-            y += alpha * (x - y)
+            y = b * (x + xPrev) - a1 * y
             out.add(y)
+            xPrev = x
         }
         return out
     }
 
     private fun firstOrderHighPass(input: List<Float>, sampleRate: Int, cutoffHz: Float): List<Float> {
         if (input.isEmpty()) return emptyList()
-        val dt = 1f / sampleRate
-        val rc = 1f / (2f * PI.toFloat() * cutoffHz)
-        val alpha = (rc / (rc + dt)).coerceIn(0f, 1f)
+        // Pre-warped bilinear transform of an analog RC high-pass.  This keeps
+        // the digital response at -3 dB exactly at cutoffHz for every stage.
+        val k = tustinRcK(sampleRate, cutoffHz)
+        val b = 1f / (1f + k)
+        val a1 = (k - 1f) / (1f + k)
 
         val out = ArrayList<Float>(input.size)
         var y = 0f
         var xPrev = 0f
         for (x in input) {
-            y = alpha * (y + x - xPrev)
+            y = b * (x - xPrev) - a1 * y
             out.add(y)
             xPrev = x
         }
@@ -4010,45 +4017,36 @@ private class RtBiquadCascade(private var sampleRate: Int) {
 
 
 private fun rtDesignRCLowPass(sampleRate: Int, cutoffHz: Float): RtBiquad {
-    // 1st order RC Backward Euler
-    // y[n] = alpha * x[n] + (1 - alpha) * y[n - 1]
-    // alpha = dt / (RC + dt)
-    val dt = 1f / sampleRate
-    val rc = 1f / (2f * PI.toFloat() * cutoffHz)
-    val alpha = (dt / (rc + dt)).coerceIn(0f, 1f)
-
-    // Biquad map:
-    // y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
-    // Here: y[n] = alpha*x[n] + (1-alpha)*y[n-1]
-    // => b0 = alpha, b1 = 0, b2 = 0
-    // => -a1 = (1-alpha) => a1 = -(1-alpha) = alpha - 1
-    // => a2 = 0
+    // Pre-warped Tustin transform.  Unlike the previous Backward Euler
+    // approximation, a single stage is exactly -3 dB at cutoffHz.
+    val k = tustinRcK(sampleRate, cutoffHz)
+    val denominator = 1f + k
     return RtBiquad(
-        b0 = alpha,
-        b1 = 0f,
+        b0 = k / denominator,
+        b1 = k / denominator,
         b2 = 0f,
-        a1 = alpha - 1f,
+        a1 = (k - 1f) / denominator,
         a2 = 0f
     )
 }
 
 private fun rtDesignRCHighPass(sampleRate: Int, cutoffHz: Float): RtBiquad {
-    // 1st order High Pass Backward Euler matches:
-    // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
-    // alpha = RC / (RC + dt)
-    val dt = 1f / sampleRate
-    val rc = 1f / (2f * PI.toFloat() * cutoffHz)
-    val alpha = (rc / (rc + dt)).coerceIn(0f, 1f)
-
-    // y[n] = alpha*x[n] - alpha*x[n-1] + alpha*y[n-1]
-    // => b0 = alpha, b1 = -alpha, b2 = 0
-    // => -a1 = alpha => a1 = -alpha
-    // => a2 = 0
+    // Pre-warped Tustin transform.  A single stage is exactly -3 dB at
+    // cutoffHz and retains unity gain at Nyquist.
+    val k = tustinRcK(sampleRate, cutoffHz)
+    val denominator = 1f + k
     return RtBiquad(
-        b0 = alpha,
-        b1 = -alpha,
+        b0 = 1f / denominator,
+        b1 = -1f / denominator,
         b2 = 0f,
-        a1 = -alpha,
+        a1 = (k - 1f) / denominator,
         a2 = 0f
     )
+}
+
+private fun tustinRcK(sampleRate: Int, cutoffHz: Float): Float {
+    val sr = sampleRate.coerceAtLeast(1).toFloat()
+    // Keep tan() finite while preserving all user-selectable cutoff values.
+    val fc = cutoffHz.coerceIn(0.001f, sr * 0.499999f)
+    return tan(PI.toFloat() * fc / sr)
 }
