@@ -24,12 +24,21 @@ internal class SimpleTriggerEngine(
     private val windowSize: Int = 512,
 ) {
     enum class Mode { OFF, RISING, FALLING }
+    /**
+     * State of the core phase identity, not of the presentation window.
+     *
+     * HOLDOVER freezes every core/template feedback path. The returned display anchor may
+     * still be chosen by rendered-window correlation when that keeps the visible waveform
+     * continuous; that presentation-only choice must never become a core observation.
+     */
+    enum class PhaseIdentityState { ACQUIRE, TRACK, HOLDOVER }
 
     data class Config(
         val mode: Mode,
         val sampleRateHz: Float,
         val preTriggerRatio: Float = 0.20f,
         val displayWindowSamples: Int = 512,
+        val displayAlignmentPoints: Int = 512,
         val globalBase: Long = 0L,
         val triggerThreshold: Float = 0.02f,
         val holdoffMs: Float = 1f,
@@ -47,6 +56,22 @@ internal class SimpleTriggerEngine(
         val corrScopeScore: Float = 0f,
         val assistScore: Float = 0f,
         val assistPhaseOffsetSamples: Int? = null,
+        val coreAnchorIndex: Int = anchorIndex,
+        val displayOffsetSamples: Int = 0,
+        val displayPeakScoreGap: Float = 1f,
+        val displayCenterScore: Float = 0f,
+        val displayBestScore: Float = 0f,
+        val displayAlignmentApplied: Boolean = false,
+        val predictedAnchorIndex: Int? = null,
+        val selectedCandidateAnchorIndex: Int = coreAnchorIndex,
+        val rawCandidateCount: Int = 0,
+        val assistCandidateCount: Int = 0,
+        val scoredCandidateCount: Int = 0,
+        val candidateScoreGap: Float = 1f,
+        val phaseIdentityState: PhaseIdentityState = PhaseIdentityState.ACQUIRE,
+        val coreObservationAccepted: Boolean = false,
+        val anchorUsable: Boolean = locked,
+        val corePhaseResidualSamples: Int = 0,
     )
 
     private val kernelSize = windowSize.coerceIn(128, 1024).let { it - it % 2 }
@@ -71,10 +96,24 @@ internal class SimpleTriggerEngine(
     private var periodAssistBuffer = FloatArray(0)
     private var fundamentalProbeBuffer = FloatArray(0)
     private var displayAlignmentBuffer = FloatArray(0)
+    private var displayAlignmentCandidate = FloatArray(0)
     private var displayAlignmentScores = FloatArray(0)
     private var displayAlignmentInitialized = false
+    private var displayPhaseTrackingEstablished = false
+    private var displayRecoveryEvidenceFrames = 0
+    private var lastLowFrequencyAssistDisplayAlignment = false
+    private var lowFrequencyAssistDisplayEvidenceFrames = 0
     private var usingLowFrequencyAssist = false
+    private var consecutiveUnlockedFrames = 0
+    private var lastTopologyMode: Mode? = null
+    private var lastTopologySampleRateHz = Float.NaN
+    private var lastTopologyDisplaySamples = 0
+    private var lastTopologyAlignmentPoints = 0
+    private var lastTopologyPreSamples = 0
+    private var phaseIdentityState = PhaseIdentityState.ACQUIRE
+    private var provisionalUnscopedGlobalPhase = Double.NaN
 
+    @Synchronized
     fun process(signal: FloatArray, config: Config): Result {
         val n = signal.size
         if (config.mode == Mode.OFF || n < kernelSize + 4) {
@@ -84,6 +123,32 @@ internal class SimpleTriggerEngine(
         if (lastGlobalBase != Long.MIN_VALUE && config.globalBase < lastGlobalBase) {
             reset()
         }
+        val displaySamples = config.displayWindowSamples.coerceIn(64, n)
+        val displayAlignmentPoints =
+            config.displayAlignmentPoints.coerceIn(64, displaySamples)
+        val preSamples = (displaySamples * config.preTriggerRatio.coerceIn(0.05f, 0.45f))
+            .roundToInt()
+            .coerceAtLeast(1)
+        val topologyChanged =
+            lastTopologyMode != null &&
+                (
+                    lastTopologyMode != config.mode ||
+                        lastTopologySampleRateHz != config.sampleRateHz ||
+                        lastTopologyDisplaySamples != displaySamples ||
+                        lastTopologyAlignmentPoints != displayAlignmentPoints ||
+                        lastTopologyPreSamples != preSamples
+                    )
+        if (topologyChanged) {
+            // A stored waveform template has meaning only in the sampling/display topology
+            // that created it. Reacquire instead of correlating a new time base or edge mode
+            // against stale phase state.
+            reset()
+        }
+        lastTopologyMode = config.mode
+        lastTopologySampleRateHz = config.sampleRateHz
+        lastTopologyDisplaySamples = displaySamples
+        lastTopologyAlignmentPoints = displayAlignmentPoints
+        lastTopologyPreSamples = preSamples
         lastGlobalBase = config.globalBase
         processFrame++
 
@@ -130,10 +195,6 @@ internal class SimpleTriggerEngine(
             return unlockedFallback(n, config)
         }
 
-        val displaySamples = config.displayWindowSamples.coerceIn(64, n)
-        val preSamples = (displaySamples * config.preTriggerRatio.coerceIn(0.05f, 0.45f))
-            .roundToInt()
-            .coerceAtLeast(1)
         val preferredAnchor = (n - displaySamples + preSamples)
             .coerceIn(kernelHalf, n - kernelHalf - 1)
         val searchRadius = if (estimatedPeriodSamples > 0) {
@@ -195,6 +256,8 @@ internal class SimpleTriggerEngine(
         val rawCandidatesEnabled =
             currentCorrScopeWeight >= RAW_CANDIDATE_WEIGHT ||
                 estimatedFrequencyHz >= CORRSCOPE_BLEND_END_HZ
+        fun predictionDistanceSamples(anchor: Int, prediction: Int): Int =
+            abs(anchor - prediction)
 
         fun anchorsFor(source: FloatArray, crossings: List<Int>): List<Int> {
             return crossings.asSequence()
@@ -252,6 +315,44 @@ internal class SimpleTriggerEngine(
             } else {
                 emptyList()
             }
+        val provisionalPredictedAnchor =
+            if (periodIsEffective &&
+                !rawCandidatesEnabled &&
+                provisionalUnscopedGlobalPhase.isFinite() &&
+                estimatedPeriodExactSamples > 0f
+            ) {
+                localAnchorForPhase(
+                    globalPhase = provisionalUnscopedGlobalPhase,
+                    globalBase = config.globalBase,
+                    preferredAnchor = preferredAnchor,
+                    periodSamples = estimatedPeriodExactSamples,
+                )
+            } else {
+                -1
+            }
+        val provisionalPhaseScopedAssistAnchors =
+            if (phaseScopedAssistAnchors.isEmpty() &&
+                provisionalPredictedAnchor >= 0 &&
+                predictionRadius > 0
+            ) {
+                assistAnchors.filter {
+                    abs(it - provisionalPredictedAnchor) <= predictionRadius
+                }
+            } else {
+                emptyList()
+            }
+        val confirmedProvisionalAssistPhase =
+            periodIsEffective &&
+                !rawCandidatesEnabled &&
+                phaseScopedAssistAnchors.isEmpty() &&
+                provisionalPhaseScopedAssistAnchors.isNotEmpty()
+        val usedUnscopedAssistFallback =
+            periodIsEffective &&
+                !rawCandidatesEnabled &&
+                predictedAnchor >= 0 &&
+                assistAnchors.isNotEmpty() &&
+                phaseScopedAssistAnchors.isEmpty() &&
+                provisionalPhaseScopedAssistAnchors.isEmpty()
         val crossingAnchorsToScore = if (!periodIsEffective) {
             if (rawAnchors.isNotEmpty()) rawAnchors.distinct() else assistAnchors.distinct()
         } else {
@@ -259,6 +360,8 @@ internal class SimpleTriggerEngine(
                 (
                     if (phaseScopedAssistAnchors.isNotEmpty()) {
                         phaseScopedAssistAnchors
+                    } else if (provisionalPhaseScopedAssistAnchors.isNotEmpty()) {
+                        provisionalPhaseScopedAssistAnchors
                     } else {
                         assistAnchors
                     }
@@ -270,7 +373,9 @@ internal class SimpleTriggerEngine(
                 if (phaseScopedRawAnchors.isNotEmpty()) {
                     phaseScopedRawAnchors.distinct()
                 } else if (predictedAnchor >= 0) {
-                    listOf(rawAnchors.minBy { abs(it - predictedAnchor) })
+                    listOf(
+                        rawAnchors.minBy { abs(it - predictedAnchor) },
+                    )
                 } else {
                     rawAnchors.distinct()
                 }
@@ -358,7 +463,7 @@ internal class SimpleTriggerEngine(
                 val distanceScale = max(estimatedPeriodSamples, kernelSize).toFloat()
                 val proximityPenalty = 0.08f * (distance / distanceScale).coerceAtMost(2f)
                 val predictionScore = if (predictedAnchor >= 0 && predictionRadius > 0) {
-                    val error = abs(anchor - predictedAnchor).toFloat()
+                    val error = predictionDistanceSamples(anchor, predictedAnchor).toFloat()
                     val sigma = max(1f, estimatedPeriodSamples * 0.14f)
                     exp(-0.5f * (error / sigma) * (error / sigma))
                 } else {
@@ -423,7 +528,8 @@ internal class SimpleTriggerEngine(
                         proximityPenalty
                 val predictionErrorRatio =
                     if (predictedAnchor >= 0 && estimatedPeriodSamples > 0) {
-                        abs(anchor - predictedAnchor).toFloat() / estimatedPeriodSamples
+                        predictionDistanceSamples(anchor, predictedAnchor).toFloat() /
+                            estimatedPeriodSamples
                     } else {
                         1f
                     }
@@ -458,6 +564,12 @@ internal class SimpleTriggerEngine(
             compareByDescending<ScoredTriggerCandidate> { it.score }
                 .thenBy { it.predictionErrorRatio },
         )
+        val candidateScoreGap =
+            if (rankedCandidates.size >= 2) {
+                rankedCandidates[0].score - rankedCandidates[1].score
+            } else {
+                1f
+            }
         if (rankedCandidates.isNotEmpty()) {
             var selectedCandidate = rankedCandidates.first()
             if (estimatedFrequencyHz >= PHASE_STICKINESS_MIN_HZ &&
@@ -465,7 +577,7 @@ internal class SimpleTriggerEngine(
                 predictedAnchor >= 0
             ) {
                 val predictedCandidate = rankedCandidates.minByOrNull { candidate ->
-                    abs(candidate.anchor - predictedAnchor)
+                    predictionDistanceSamples(candidate.anchor, predictedAnchor)
                 }
                 if (predictedCandidate != null) {
                     val second = rankedCandidates.getOrNull(1)
@@ -532,6 +644,88 @@ internal class SimpleTriggerEngine(
             bestAssistPhaseOffset = selectedCandidate.assistPhaseOffset
         }
 
+        val requiresProvisionalConfirmation =
+            usedUnscopedAssistFallback &&
+                scoredCandidates.size > 1 &&
+                bestScore < MINIMUM_UNSCOPED_OBSERVATION_CONFIDENCE
+        if (requiresProvisionalConfirmation) {
+            // A weak winner among multiple gate-external candidates is only a provisional
+            // observation. Committing it immediately would let one ambiguous edge redefine
+            // every template and the next phase prediction. Keep the committed core identity
+            // for one frame while the display independently refines around the observation; the
+            // following frame may return to the committed branch or confirm the new one. A sole
+            // candidate or a strong winner remains observable during real phase drift, where the
+            // period estimator can legitimately lag behind the signal.
+            provisionalUnscopedGlobalPhase = (config.globalBase + bestAnchor).toDouble()
+            phaseIdentityState = PhaseIdentityState.HOLDOVER
+            consecutiveUnlockedFrames = 0
+            val period = estimatedPeriodSamples.coerceAtLeast(0)
+            val holdoverDisplayAlignmentApplied =
+                displayAlignmentInitialized &&
+                    displayAlignmentBuffer.size == displayAlignmentPoints
+            val holdoverDisplayDecision =
+                if (holdoverDisplayAlignmentApplied) {
+                    refineDisplayAlignment(
+                        signal = signal,
+                        center = bestAnchor,
+                        radius = (period * DISPLAY_ALIGNMENT_RADIUS_RATIO)
+                            .roundToInt()
+                            .coerceIn(4, MAX_DISPLAY_ALIGNMENT_RADIUS_SAMPLES),
+                        displaySamples = displaySamples,
+                        displayAlignmentPoints = displayAlignmentPoints,
+                        preSamples = preSamples,
+                    )
+                } else {
+                    DisplayAlignmentDecision(
+                        anchor = bestAnchor,
+                        bestScore = 0f,
+                        secondBestScore = Float.NEGATIVE_INFINITY,
+                        centerScore = 0f,
+                    )
+                }
+            val holdoverDisplayAnchor = holdoverDisplayDecision.anchor
+            return Result(
+                anchorIndex = holdoverDisplayAnchor,
+                periodSamples = period,
+                confidence = bestScore.coerceIn(0f, 1f),
+                locked = true,
+                mode = config.mode,
+                freqHz = if (period > 0) config.sampleRateHz / period else 0f,
+                triggerScore = bestScore.coerceIn(0f, 1f),
+                corrScopeWeight = currentCorrScopeWeight,
+                corrScopeScore = bestCorrScopeEffect,
+                assistScore = bestAssistEffect,
+                assistPhaseOffsetSamples = bestAssistPhaseOffset,
+                coreAnchorIndex = predictedAnchor,
+                displayOffsetSamples = holdoverDisplayAnchor - predictedAnchor,
+                displayPeakScoreGap =
+                    if (holdoverDisplayDecision.secondBestScore.isFinite()) {
+                        holdoverDisplayDecision.bestScore -
+                            holdoverDisplayDecision.secondBestScore
+                    } else {
+                        1f
+                    },
+                displayCenterScore = holdoverDisplayDecision.centerScore,
+                displayBestScore = holdoverDisplayDecision.bestScore,
+                displayAlignmentApplied = holdoverDisplayAlignmentApplied,
+                predictedAnchorIndex = predictedAnchor,
+                selectedCandidateAnchorIndex = bestAnchor,
+                rawCandidateCount = rawAnchors.size,
+                assistCandidateCount = assistAnchors.size,
+                scoredCandidateCount = scoredCandidates.size,
+                candidateScoreGap = candidateScoreGap,
+                phaseIdentityState = PhaseIdentityState.HOLDOVER,
+                coreObservationAccepted = false,
+                anchorUsable = true,
+                corePhaseResidualSamples = 0,
+            )
+        }
+        if (phaseScopedAssistAnchors.isNotEmpty() || confirmedProvisionalAssistPhase) {
+            provisionalUnscopedGlobalPhase = Double.NaN
+        } else if (usedUnscopedAssistFallback) {
+            provisionalUnscopedGlobalPhase = Double.NaN
+        }
+
         val refinementRadius = (estimatedPeriodSamples * 0.04f)
             .roundToInt()
             .coerceIn(3, MAX_CORRELATION_REFINEMENT_RADIUS_SAMPLES)
@@ -549,7 +743,7 @@ internal class SimpleTriggerEngine(
             } else {
                 bestAnchor
             }
-        val displayAlignmentStrength =
+        val frequencyScheduledDisplayAlignmentStrength =
             smoothStep(
                 estimatedFrequencyHz,
                 DISPLAY_ALIGNMENT_BLEND_IN_START_HZ,
@@ -561,79 +755,198 @@ internal class SimpleTriggerEngine(
                     DISPLAY_ALIGNMENT_BLEND_OUT_END_HZ,
                 )
                 )
+        // Below the Raw/CorrScope transition, the sole assisted crossing owns the core
+        // fundamental identity. Carrier detail can still move around that crossing by dozens
+        // of rendered points, so presentation correlation remains useful even though it must
+        // not feed the core phase or assisted reference template.
+        val lowFrequencyAssistDisplayRequested =
+            periodIsEffective && !rawCandidatesEnabled
+        lowFrequencyAssistDisplayEvidenceFrames =
+            if (lowFrequencyAssistDisplayRequested) {
+                (lowFrequencyAssistDisplayEvidenceFrames + 1)
+                    .coerceAtMost(LOW_FREQUENCY_DISPLAY_ALIGNMENT_CONFIRMATION_FRAMES)
+            } else {
+                0
+            }
+        val lowFrequencyAssistDisplayAlignment =
+            lowFrequencyAssistDisplayEvidenceFrames >=
+                LOW_FREQUENCY_DISPLAY_ALIGNMENT_CONFIRMATION_FRAMES
+        if (lastLowFrequencyAssistDisplayAlignment &&
+            !lowFrequencyAssistDisplayAlignment
+        ) {
+            // Do not let the low-frequency bridge's "tracking established" state authorize
+            // an immediate Raw/CorrScope correction. Raw evidence must establish itself.
+            displayPhaseTrackingEstablished = false
+            displayRecoveryEvidenceFrames = 0
+        }
+        lastLowFrequencyAssistDisplayAlignment = lowFrequencyAssistDisplayAlignment
+        val displayAlignmentStrength =
+            if (lowFrequencyAssistDisplayAlignment) {
+                1f
+            } else {
+                frequencyScheduledDisplayAlignmentStrength
+            }
+        val displayAlignmentRadiusRatio =
+            if (lowFrequencyAssistDisplayAlignment) {
+                LOW_FREQUENCY_DISPLAY_ALIGNMENT_RADIUS_RATIO
+            } else if (estimatedFrequencyHz > DISPLAY_ALIGNMENT_HIGH_FREQUENCY_START_HZ) {
+                DISPLAY_ALIGNMENT_HIGH_FREQUENCY_RADIUS_RATIO
+            } else {
+                DISPLAY_ALIGNMENT_RADIUS_RATIO
+            }
         val displayAlignmentRadius = (
-            estimatedPeriodSamples *
-                DISPLAY_ALIGNMENT_RADIUS_RATIO *
-                displayAlignmentStrength
+            estimatedPeriodSamples * displayAlignmentRadiusRatio * displayAlignmentStrength
             )
             .roundToInt()
             .coerceIn(4, MAX_DISPLAY_ALIGNMENT_RADIUS_SAMPLES)
-        val stabilizedAnchor =
-            if (displayAlignmentInitialized &&
-                displayAlignmentBuffer.size == displaySamples &&
-                currentCorrScopeWeight >= DISPLAY_ALIGNMENT_MIN_WEIGHT &&
+        // In TRACK, edge/correlation candidates own the core proposal and rendered-domain
+        // correlation owns only the final display anchor. Feedback ownership is selected below:
+        // assist tracking commits the core phase, while raw CorrScope tracking keeps its
+        // established gradual feedback from the displayed anchor.
+        val displayAlignmentCandidateAvailable =
+            displayAlignmentInitialized &&
+                displayAlignmentBuffer.size == displayAlignmentPoints &&
+                (
+                    !lowFrequencyAssistDisplayAlignment ||
+                        correlationAnchor in
+                        preSamples..(signal.size - displaySamples + preSamples)
+                    ) &&
                 displayAlignmentStrength > DISPLAY_ALIGNMENT_MIN_STRENGTH
-            ) {
+        val displayAlignmentCandidate =
+            if (displayAlignmentCandidateAvailable) {
                 refineDisplayAlignment(
                     signal = signal,
                     center = correlationAnchor,
                     radius = displayAlignmentRadius,
                     displaySamples = displaySamples,
+                    displayAlignmentPoints = displayAlignmentPoints,
                     preSamples = preSamples,
                 )
             } else {
-                correlationAnchor
+                DisplayAlignmentDecision(
+                    anchor = correlationAnchor,
+                    bestScore = 0f,
+                    secondBestScore = Float.NEGATIVE_INFINITY,
+                    centerScore = 0f,
+                )
             }
-        val stabilizedAssistPhaseOffset = nearestAssistOffset(stabilizedAnchor)
+        val displayAlignmentImprovement =
+            displayAlignmentCandidate.bestScore - displayAlignmentCandidate.centerScore
+        val lowWeightRecoveryGate = max(
+            DISPLAY_ALIGNMENT_MIN_RECOVERY_ERROR_SAMPLES,
+            (estimatedPeriodSamples * DISPLAY_ALIGNMENT_RECOVERY_ERROR_RATIO).roundToInt(),
+        )
+        val needsLowWeightRecovery =
+            predictedAnchor >= 0 &&
+                abs(correlationAnchor - predictedAnchor) >= lowWeightRecoveryGate &&
+                displayAlignmentImprovement >= DISPLAY_ALIGNMENT_MIN_IMPROVEMENT
+        if (!displayAlignmentCandidateAvailable) {
+            displayRecoveryEvidenceFrames = 0
+            if (displayAlignmentStrength <= DISPLAY_ALIGNMENT_MIN_STRENGTH) {
+                displayPhaseTrackingEstablished = false
+            }
+        } else if (currentCorrScopeWeight >= DISPLAY_ALIGNMENT_BOOTSTRAP_WEIGHT &&
+            estimatedFrequencyHz <= DISPLAY_ALIGNMENT_BOOTSTRAP_MAX_HZ
+        ) {
+            displayPhaseTrackingEstablished = true
+            displayRecoveryEvidenceFrames = 0
+        } else if (!displayPhaseTrackingEstablished) {
+            displayRecoveryEvidenceFrames =
+                if (needsLowWeightRecovery) {
+                    displayRecoveryEvidenceFrames + 1
+                } else {
+                    0
+                }
+            if (displayRecoveryEvidenceFrames >= DISPLAY_RECOVERY_CONFIRMATION_FRAMES) {
+                displayPhaseTrackingEstablished = true
+                displayRecoveryEvidenceFrames = 0
+            }
+        }
+        val displayAlignmentApplied =
+            displayAlignmentCandidateAvailable && displayPhaseTrackingEstablished
+        val displayAlignmentDecision =
+            if (displayAlignmentApplied) {
+                displayAlignmentCandidate
+            } else {
+                DisplayAlignmentDecision(
+                    anchor = correlationAnchor,
+                    bestScore = displayAlignmentCandidate.bestScore,
+                    secondBestScore = displayAlignmentCandidate.secondBestScore,
+                    centerScore = displayAlignmentCandidate.centerScore,
+                )
+            }
+        val coreProposalAnchor = correlationAnchor
+        val committedAnchor = displayAlignmentDecision.anchor
+        val committedAssistPhaseOffset = nearestAssistOffset(committedAnchor)
 
         val triggerScore = (
             bestAssistEffect +
                 (bestCorrScopeEffect - bestAssistEffect) * currentCorrScopeWeight
             ).coerceIn(0f, 1f)
+        val correlationReferenceAnchor =
+            if (rawCandidatesEnabled) committedAnchor else coreProposalAnchor
         bufferInitialized = updateCorrelationBuffer(
             signal = signal,
-            anchor = stabilizedAnchor,
+            anchor = correlationReferenceAnchor,
             buffer = correlationBuffer,
             wasInitialized = bufferInitialized,
             responsiveness = RAW_REFERENCE_RESPONSIVENESS,
         )
         assistBufferInitialized = updateCorrelationBuffer(
             signal = periodAssistBuffer,
-            anchor = stabilizedAnchor,
+            anchor = correlationReferenceAnchor,
             buffer = assistCorrelationBuffer,
             wasInitialized = assistBufferInitialized,
             responsiveness = ASSIST_REFERENCE_RESPONSIVENESS,
         )
         displayAlignmentInitialized = updateDisplayAlignmentBuffer(
             signal = signal,
-            anchor = stabilizedAnchor,
+            anchor = committedAnchor,
             displaySamples = displaySamples,
+            displayAlignmentPoints = displayAlignmentPoints,
             preSamples = preSamples,
             wasInitialized = displayAlignmentInitialized,
         )
-        lastTriggerGlobalIdx = config.globalBase + stabilizedAnchor
+        val coreGlobalAnchor = config.globalBase + coreProposalAnchor
+        lastTriggerGlobalIdx = config.globalBase + committedAnchor
         lastTriggerGlobalPhase =
-            if (pendingPredictedGlobalPhase.isFinite() &&
+            if (!rawCandidatesEnabled &&
+                pendingPredictedGlobalPhase.isFinite() &&
+                estimatedPeriodExactSamples > 0f
+            ) {
+                val period = estimatedPeriodExactSamples.toDouble()
+                val directResidual = coreGlobalAnchor - pendingPredictedGlobalPhase
+                val nearestCycle = (directResidual / period).roundToLong()
+                val wrappedResidual = directResidual - nearestCycle * period
+                if (abs(wrappedResidual) <= period * 0.25) {
+                    pendingPredictedGlobalPhase + wrappedResidual
+                } else {
+                    coreGlobalAnchor.toDouble()
+                }
+            } else if (rawCandidatesEnabled &&
+                pendingPredictedGlobalPhase.isFinite() &&
                 estimatedPeriodExactSamples > 0f &&
                 abs(lastTriggerGlobalIdx - pendingPredictedGlobalPhase) <=
                 estimatedPeriodExactSamples * 0.25
             ) {
-                val phaseFeedback =
-                    if (estimatedFrequencyHz < PHASE_STICKINESS_MIN_HZ) {
-                        1f
-                    } else {
-                        smoothStep(
-                            currentCorrScopeWeight,
-                            PHASE_FEEDBACK_START_WEIGHT,
-                            PHASE_FEEDBACK_FULL_WEIGHT,
-                        )
-                    }
+                val phaseFeedback = smoothStep(
+                    currentCorrScopeWeight,
+                    PHASE_FEEDBACK_START_WEIGHT,
+                    PHASE_FEEDBACK_FULL_WEIGHT,
+                )
                 pendingPredictedGlobalPhase +
                     (lastTriggerGlobalIdx - pendingPredictedGlobalPhase) * phaseFeedback
             } else {
-                lastTriggerGlobalIdx.toDouble()
-        }
+                if (rawCandidatesEnabled) {
+                    lastTriggerGlobalIdx.toDouble()
+                } else {
+                    coreGlobalAnchor.toDouble()
+                }
+            }
         if (periodIsEffective) lastScoredPeriodSamples = estimatedPeriodSamples
+        // This state belongs to the upstream assist-candidate identity, not to the final
+        // rendered-domain correction. Folding the visual offset back into assist-candidate
+        // scoring measurably destabilizes CP013.
         bestAssistPhaseOffset?.let { selectedOffset ->
             if (lastAssistPhaseOffsetSamples == Int.MIN_VALUE) {
                 lastAssistPhaseOffsetSamples = selectedOffset
@@ -646,8 +959,10 @@ internal class SimpleTriggerEngine(
 
         val period = estimatedPeriodSamples.coerceAtLeast(0)
         val frequency = if (period > 0) config.sampleRateHz / period else 0f
+        consecutiveUnlockedFrames = 0
+        phaseIdentityState = PhaseIdentityState.TRACK
         return Result(
-            anchorIndex = stabilizedAnchor,
+            anchorIndex = committedAnchor,
             periodSamples = period,
             confidence = triggerScore,
             locked = true,
@@ -657,7 +972,30 @@ internal class SimpleTriggerEngine(
             corrScopeWeight = currentCorrScopeWeight,
             corrScopeScore = bestCorrScopeEffect,
             assistScore = bestAssistEffect,
-            assistPhaseOffsetSamples = stabilizedAssistPhaseOffset,
+            assistPhaseOffsetSamples = committedAssistPhaseOffset,
+            coreAnchorIndex = coreProposalAnchor,
+            displayOffsetSamples = committedAnchor - coreProposalAnchor,
+            displayPeakScoreGap =
+                if (displayAlignmentDecision.secondBestScore.isFinite()) {
+                    displayAlignmentDecision.bestScore -
+                        displayAlignmentDecision.secondBestScore
+                } else {
+                    1f
+                },
+            displayCenterScore = displayAlignmentDecision.centerScore,
+            displayBestScore = displayAlignmentCandidate.bestScore,
+            displayAlignmentApplied = displayAlignmentApplied,
+            predictedAnchorIndex = predictedAnchor.takeIf { it >= 0 },
+            selectedCandidateAnchorIndex = bestAnchor,
+            rawCandidateCount = rawAnchors.size,
+            assistCandidateCount = assistAnchors.size,
+            scoredCandidateCount = scoredCandidates.size,
+            candidateScoreGap = candidateScoreGap,
+            phaseIdentityState = PhaseIdentityState.TRACK,
+            coreObservationAccepted = true,
+            anchorUsable = true,
+            corePhaseResidualSamples =
+                if (predictedAnchor >= 0) coreProposalAnchor - predictedAnchor else 0,
         )
     }
 
@@ -676,6 +1014,22 @@ internal class SimpleTriggerEngine(
         val cycles = floor(delta / period)
         pendingPredictedGlobalPhase = lastTriggerGlobalPhase + cycles * period
         return (pendingPredictedGlobalPhase.roundToLong() - globalBase)
+            .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())
+            .toInt()
+    }
+
+    private fun localAnchorForPhase(
+        globalPhase: Double,
+        globalBase: Long,
+        preferredAnchor: Int,
+        periodSamples: Float,
+    ): Int {
+        if (!globalPhase.isFinite() || periodSamples <= 0f) return -1
+        val period = periodSamples.toDouble()
+        val preferredGlobal = (globalBase + preferredAnchor).toDouble()
+        val cycles = floor((preferredGlobal - globalPhase) / period)
+        val predictedGlobal = globalPhase + cycles * period
+        return (predictedGlobal.roundToLong() - globalBase)
             .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())
             .toInt()
     }
@@ -1148,18 +1502,33 @@ internal class SimpleTriggerEngine(
         return true
     }
 
+    private data class DisplayAlignmentDecision(
+        val anchor: Int,
+        val bestScore: Float,
+        val secondBestScore: Float,
+        val centerScore: Float,
+    )
+
     private fun refineDisplayAlignment(
         signal: FloatArray,
         center: Int,
         radius: Int,
         displaySamples: Int,
+        displayAlignmentPoints: Int,
         preSamples: Int,
-    ): Int {
+    ): DisplayAlignmentDecision {
         val minimumAnchor = preSamples
         val maximumAnchor = signal.size - displaySamples + preSamples
         val begin = max(minimumAnchor, center - radius)
         val end = min(maximumAnchor, center + radius)
-        if (begin >= end) return center.coerceIn(minimumAnchor, maximumAnchor)
+        if (begin >= end) {
+            return DisplayAlignmentDecision(
+                anchor = center.coerceIn(minimumAnchor, maximumAnchor),
+                bestScore = 0f,
+                secondBestScore = Float.NEGATIVE_INFINITY,
+                centerScore = 0f,
+            )
+        }
 
         val scoreCount = end - begin + 1
         if (displayAlignmentScores.size < scoreCount) {
@@ -1170,42 +1539,60 @@ internal class SimpleTriggerEngine(
                 signal = signal,
                 anchor = begin + offset,
                 displaySamples = displaySamples,
+                displayAlignmentPoints = displayAlignmentPoints,
                 preSamples = preSamples,
             )
         }
 
-        var bestAnchor = center.coerceIn(begin, end)
+        val centerOffset = (center.coerceIn(begin, end) - begin)
+            .coerceIn(0, scoreCount - 1)
+        var bestOffset = centerOffset
         var bestScore = Float.NEGATIVE_INFINITY
-        for (offset in 1 until scoreCount - 1) {
+        for (offset in 0 until scoreCount) {
             val score = displayAlignmentScores[offset]
-            if (score >= displayAlignmentScores[offset - 1] &&
-                score >= displayAlignmentScores[offset + 1] &&
-                score > bestScore
-            ) {
+            if (score > bestScore) {
                 bestScore = score
-                bestAnchor = begin + offset
+                bestOffset = offset
             }
         }
-        return bestAnchor
+        var secondBestScore = Float.NEGATIVE_INFINITY
+        for (offset in 0 until scoreCount) {
+            if (abs(offset - bestOffset) <= DISPLAY_SEPARATED_PEAK_RADIUS_SAMPLES) continue
+            secondBestScore = max(secondBestScore, displayAlignmentScores[offset])
+        }
+        return DisplayAlignmentDecision(
+            anchor = begin + bestOffset,
+            bestScore = bestScore,
+            secondBestScore = secondBestScore,
+            centerScore = displayAlignmentScores[centerOffset],
+        )
     }
 
     private fun displayAlignmentCorrelation(
         signal: FloatArray,
         anchor: Int,
         displaySamples: Int,
+        displayAlignmentPoints: Int,
         preSamples: Int,
     ): Float {
         val start = (anchor - preSamples)
             .coerceIn(0, max(0, signal.size - displaySamples))
+        ensureDisplayAlignmentCandidateSize(displayAlignmentPoints)
+        peakDownsampleWindow(
+            signal = signal,
+            start = start,
+            sourceSamples = displaySamples,
+            target = displayAlignmentCandidate,
+        )
         var mean = 0f
-        for (i in 0 until displaySamples) mean += signal[start + i]
-        mean /= displaySamples
+        for (i in 0 until displayAlignmentPoints) mean += displayAlignmentCandidate[i]
+        mean /= displayAlignmentPoints
 
         var dot = 0f
         var candidateEnergy = 0f
         var bufferEnergy = 0f
-        for (i in 0 until displaySamples) {
-            val candidate = signal[start + i] - mean
+        for (i in 0 until displayAlignmentPoints) {
+            val candidate = displayAlignmentCandidate[i] - mean
             val reference = displayAlignmentBuffer[i]
             dot += candidate * reference
             candidateEnergy += candidate * candidate
@@ -1219,22 +1606,30 @@ internal class SimpleTriggerEngine(
         signal: FloatArray,
         anchor: Int,
         displaySamples: Int,
+        displayAlignmentPoints: Int,
         preSamples: Int,
         wasInitialized: Boolean,
     ): Boolean {
-        if (displayAlignmentBuffer.size != displaySamples) {
-            displayAlignmentBuffer = FloatArray(displaySamples)
+        if (displayAlignmentBuffer.size != displayAlignmentPoints) {
+            displayAlignmentBuffer = FloatArray(displayAlignmentPoints)
             displayAlignmentInitialized = false
         }
         val start = (anchor - preSamples)
             .coerceIn(0, max(0, signal.size - displaySamples))
+        ensureDisplayAlignmentCandidateSize(displayAlignmentPoints)
+        peakDownsampleWindow(
+            signal = signal,
+            start = start,
+            sourceSamples = displaySamples,
+            target = displayAlignmentCandidate,
+        )
         var mean = 0f
-        for (i in 0 until displaySamples) mean += signal[start + i]
-        mean /= displaySamples
+        for (i in 0 until displayAlignmentPoints) mean += displayAlignmentCandidate[i]
+        mean /= displayAlignmentPoints
 
         var energy = 0f
-        for (i in 0 until displaySamples) {
-            val centered = signal[start + i] - mean
+        for (i in 0 until displayAlignmentPoints) {
+            val centered = displayAlignmentCandidate[i] - mean
             energy += centered * centered
         }
         val scale = 1f / sqrt(energy).coerceAtLeast(1e-6f)
@@ -1244,12 +1639,40 @@ internal class SimpleTriggerEngine(
             } else {
                 1f
             }
-        for (i in 0 until displaySamples) {
-            val aligned = (signal[start + i] - mean) * scale
+        for (i in 0 until displayAlignmentPoints) {
+            val aligned = (displayAlignmentCandidate[i] - mean) * scale
             displayAlignmentBuffer[i] +=
                 responsiveness * (aligned - displayAlignmentBuffer[i])
         }
         return true
+    }
+
+    private fun ensureDisplayAlignmentCandidateSize(size: Int) {
+        if (displayAlignmentCandidate.size != size) {
+            displayAlignmentCandidate = FloatArray(size)
+        }
+    }
+
+    private fun peakDownsampleWindow(
+        signal: FloatArray,
+        start: Int,
+        sourceSamples: Int,
+        target: FloatArray,
+    ) {
+        val bucketSize = sourceSamples.toFloat() / target.size
+        for (point in target.indices) {
+            val bucketStart = start + (point * bucketSize).toInt()
+            val bucketEnd = min(
+                start + ((point + 1) * bucketSize).toInt(),
+                start + sourceSamples,
+            )
+            var peak = 0f
+            for (sampleIndex in bucketStart until bucketEnd) {
+                val sample = signal[sampleIndex]
+                if (abs(sample) > abs(peak)) peak = sample
+            }
+            target[point] = peak
+        }
     }
 
     private fun edgeScore(
@@ -1358,6 +1781,7 @@ internal class SimpleTriggerEngine(
             n / 2
         }
         val period = estimatedPeriodSamples.coerceAtLeast(0)
+        registerTrackingMiss()
         return Result(
             anchorIndex = local,
             periodSamples = period,
@@ -1368,6 +1792,35 @@ internal class SimpleTriggerEngine(
             triggerScore = 0f,
             corrScopeWeight = currentCorrScopeWeight,
         )
+    }
+
+    private fun registerTrackingMiss() {
+        consecutiveUnlockedFrames += 1
+
+        // Never let a display template survive an observed loss of lock. Reusing it would
+        // allow a stale peak to be accepted and written back on the first recovered frame.
+        displayAlignmentInitialized = false
+        displayPhaseTrackingEstablished = false
+        displayRecoveryEvidenceFrames = 0
+        lastLowFrequencyAssistDisplayAlignment = false
+        lowFrequencyAssistDisplayEvidenceFrames = 0
+        displayAlignmentBuffer.fill(0f)
+
+        if (consecutiveUnlockedFrames < TRACKING_STATE_RESET_AFTER_MISSES) return
+
+        // After a sustained miss the physical phase identity is unknowable. Keep the latest
+        // period estimate as an acquisition hint, but discard all phase and waveform feedback.
+        correlationBuffer.fill(0f)
+        assistCorrelationBuffer.fill(0f)
+        bufferInitialized = false
+        assistBufferInitialized = false
+        lastTriggerGlobalIdx = Long.MIN_VALUE
+        lastTriggerGlobalPhase = Double.NaN
+        pendingPredictedGlobalPhase = Double.NaN
+        lastScoredPeriodSamples = 0
+        lastAssistPhaseOffsetSamples = Int.MIN_VALUE
+        phaseIdentityState = PhaseIdentityState.ACQUIRE
+        provisionalUnscopedGlobalPhase = Double.NaN
     }
 
     private fun rms(signal: FloatArray): Float {
@@ -1382,13 +1835,18 @@ internal class SimpleTriggerEngine(
         return x * x * (3f - 2f * x)
     }
 
-    private fun reset() {
+    @Synchronized
+    internal fun reset() {
         correlationBuffer.fill(0f)
         assistCorrelationBuffer.fill(0f)
         candidateBuffer.fill(0f)
         bufferInitialized = false
         assistBufferInitialized = false
         displayAlignmentInitialized = false
+        displayPhaseTrackingEstablished = false
+        displayRecoveryEvidenceFrames = 0
+        lastLowFrequencyAssistDisplayAlignment = false
+        lowFrequencyAssistDisplayEvidenceFrames = 0
         displayAlignmentBuffer.fill(0f)
         lastTriggerGlobalIdx = Long.MIN_VALUE
         lastTriggerGlobalPhase = Double.NaN
@@ -1401,9 +1859,18 @@ internal class SimpleTriggerEngine(
         currentCorrScopeWeight = 0f
         processFrame = 0
         usingLowFrequencyAssist = false
+        consecutiveUnlockedFrames = 0
+        lastTopologyMode = null
+        lastTopologySampleRateHz = Float.NaN
+        lastTopologyDisplaySamples = 0
+        lastTopologyAlignmentPoints = 0
+        lastTopologyPreSamples = 0
+        phaseIdentityState = PhaseIdentityState.ACQUIRE
+        provisionalUnscopedGlobalPhase = Double.NaN
     }
 
     internal companion object {
+        private const val TRACKING_STATE_RESET_AFTER_MISSES = 2
         private const val LOW_FREQUENCY_ASSIST_ENTER_HZ = 70f
         private const val LOW_FREQUENCY_ASSIST_EXIT_HZ = 85f
         private const val LOW_FREQUENCY_FAST_EXIT_RATIO = 1.10f
@@ -1426,14 +1893,24 @@ internal class SimpleTriggerEngine(
         private const val PHASE_FEEDBACK_FULL_WEIGHT = 0.25f
         private const val CORRSCOPE_PHASE_STABILIZE_WEIGHT = 0.65f
         private const val MAX_CORRELATION_REFINEMENT_RADIUS_SAMPLES = 12
-        private const val DISPLAY_ALIGNMENT_MIN_WEIGHT = 0.65f
+        private const val DISPLAY_ALIGNMENT_BOOTSTRAP_WEIGHT = 0.65f
+        private const val DISPLAY_ALIGNMENT_BOOTSTRAP_MAX_HZ = 115f
         private const val DISPLAY_ALIGNMENT_MIN_STRENGTH = 0.05f
+        private const val DISPLAY_ALIGNMENT_MIN_IMPROVEMENT = 0.05f
+        private const val DISPLAY_ALIGNMENT_RECOVERY_ERROR_RATIO = 0.02f
+        private const val DISPLAY_ALIGNMENT_MIN_RECOVERY_ERROR_SAMPLES = 12
+        private const val DISPLAY_RECOVERY_CONFIRMATION_FRAMES = 2
         private const val DISPLAY_ALIGNMENT_BLEND_IN_START_HZ = 45f
         private const val DISPLAY_ALIGNMENT_BLEND_IN_END_HZ = 52f
-        private const val DISPLAY_ALIGNMENT_BLEND_OUT_START_HZ = 75f
-        private const val DISPLAY_ALIGNMENT_BLEND_OUT_END_HZ = 95f
+        private const val DISPLAY_ALIGNMENT_BLEND_OUT_START_HZ = 115f
+        private const val DISPLAY_ALIGNMENT_BLEND_OUT_END_HZ = 130f
         private const val DISPLAY_ALIGNMENT_RADIUS_RATIO = 0.12f
+        private const val LOW_FREQUENCY_DISPLAY_ALIGNMENT_RADIUS_RATIO = 0.025f
+        private const val LOW_FREQUENCY_DISPLAY_ALIGNMENT_CONFIRMATION_FRAMES = 2
+        private const val DISPLAY_ALIGNMENT_HIGH_FREQUENCY_START_HZ = 95f
+        private const val DISPLAY_ALIGNMENT_HIGH_FREQUENCY_RADIUS_RATIO = 0.20f
         private const val MAX_DISPLAY_ALIGNMENT_RADIUS_SAMPLES = 100
+        private const val DISPLAY_SEPARATED_PEAK_RADIUS_SAMPLES = 8
         private const val DISPLAY_ALIGNMENT_RESPONSIVENESS = 1.00f
         private const val RAW_REFERENCE_RESPONSIVENESS = 0.05f
         private const val ASSIST_REFERENCE_RESPONSIVENESS = 0.15f
@@ -1446,5 +1923,6 @@ internal class SimpleTriggerEngine(
         private const val PHASE_STICKINESS_MARGIN = 0.14f
         private const val PREDICTION_ERROR_ADVANTAGE = 0.08f
         private const val MINIMUM_CONFIDENCE_FOR_SWITCH = 0.46f
+        private const val MINIMUM_UNSCOPED_OBSERVATION_CONFIDENCE = 0.60f
     }
 }

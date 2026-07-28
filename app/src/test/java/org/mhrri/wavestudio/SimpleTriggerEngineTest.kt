@@ -44,6 +44,80 @@ class SimpleTriggerEngineTest {
     }
 
     @Test
+    fun resetMakesTheNextFrameAFreshAcquisition() {
+        val warmed = SimpleTriggerEngine()
+        repeat(8) { frame ->
+            val globalBase = frame * 1_440L
+            warmed.process(sineFrame(globalBase), config(globalBase))
+        }
+
+        warmed.reset()
+        val afterReset = warmed.process(sineFrame(globalBase = 0L), config(globalBase = 0L))
+        val fresh = SimpleTriggerEngine().process(
+            sineFrame(globalBase = 0L),
+            config(globalBase = 0L),
+        )
+
+        assertTrue(afterReset.locked)
+        assertTrue(afterReset.anchorIndex == fresh.anchorIndex)
+        assertTrue(afterReset.periodSamples == fresh.periodSamples)
+    }
+
+    @Test
+    fun displayTopologyChangeReacquiresInsteadOfUsingTheOldTemplate() {
+        val warmed = SimpleTriggerEngine()
+        repeat(8) { frame ->
+            val globalBase = frame * 1_440L
+            warmed.process(
+                sineFrame(globalBase, size = 4_800),
+                config(globalBase).copy(
+                    displayWindowSamples = 2_400,
+                    displayAlignmentPoints = 512,
+                ),
+            )
+        }
+
+        val changedBase = 8 * 1_440L
+        val changedConfig = config(changedBase).copy(
+            displayWindowSamples = 1_200,
+            displayAlignmentPoints = 384,
+        )
+        val changedSource = sineFrame(changedBase, size = 4_800)
+        val afterChange = warmed.process(changedSource, changedConfig)
+        val fresh = SimpleTriggerEngine().process(changedSource, changedConfig)
+
+        assertTrue(afterChange.locked)
+        assertTrue(afterChange.anchorIndex == fresh.anchorIndex)
+        assertTrue(afterChange.periodSamples == fresh.periodSamples)
+        assertTrue(!afterChange.displayAlignmentApplied)
+    }
+
+    @Test
+    fun sustainedUnlockDiscardsOldPhaseFeedbackBeforeRecovery() {
+        val warmed = SimpleTriggerEngine()
+        repeat(8) { frame ->
+            val globalBase = frame * 1_440L
+            warmed.process(sineFrame(globalBase), config(globalBase))
+        }
+
+        val firstMissBase = 8 * 1_440L
+        val secondMissBase = 9 * 1_440L
+        val recoveryBase = 10 * 1_440L
+        val firstMiss = warmed.process(FloatArray(frameSize), config(firstMissBase))
+        val secondMiss = warmed.process(FloatArray(frameSize), config(secondMissBase))
+        val recoverySource = sineFrame(recoveryBase)
+        val recovered = warmed.process(recoverySource, config(recoveryBase))
+        val fresh = SimpleTriggerEngine().process(recoverySource, config(recoveryBase))
+
+        assertTrue(!firstMiss.locked)
+        assertTrue(!secondMiss.locked)
+        assertTrue(recovered.locked)
+        assertTrue(recovered.anchorIndex == fresh.anchorIndex)
+        assertTrue(recovered.periodSamples == fresh.periodSamples)
+        assertTrue(!recovered.displayAlignmentApplied)
+    }
+
+    @Test
     fun phaseLockIsIndependentOfDisplayRefreshRate() {
         for (refreshHz in listOf(10, 20, 30, 60)) {
             val engine = SimpleTriggerEngine()
@@ -186,6 +260,7 @@ class SimpleTriggerEngineTest {
             val phases = ArrayList<Int>()
             val weights = ArrayList<Float>()
             val periods = ArrayList<Int>()
+            val displayAlignment = ArrayList<String>()
 
             repeat(72) { frame ->
                 val globalBase = frame.toLong() * samplesPerFrame
@@ -203,6 +278,9 @@ class SimpleTriggerEngineTest {
                     phases += floorMod(globalBase + result.anchorIndex, fundamentalPeriod)
                     weights += result.corrScopeWeight
                     periods += result.periodSamples
+                    displayAlignment +=
+                        "${result.displayAlignmentApplied}:" +
+                        "${"%.3f".format(result.displayBestScore - result.displayCenterScore)}"
                 }
             }
 
@@ -213,7 +291,7 @@ class SimpleTriggerEngineTest {
             }
             assertTrue(
                 "frequency=$frequency jitter=$maximumJitter phases=$phases " +
-                    "weights=$weights periods=$periods",
+                    "weights=$weights periods=$periods displayAlignment=$displayAlignment",
                 maximumJitter <= 10,
             )
         }
@@ -276,6 +354,7 @@ class SimpleTriggerEngineTest {
             val engine = SimpleTriggerEngine()
             val samplesPerFrame = (sampleRate / 60f).roundToInt()
             val phases = ArrayList<Double>()
+            val phaseDiagnostics = ArrayList<String>()
 
             repeat(72) { frame ->
                 val globalBase = frame.toLong() * samplesPerFrame
@@ -296,6 +375,18 @@ class SimpleTriggerEngineTest {
                         frequency * (globalBase + result.anchorIndex) / sampleRate +
                             phaseOffset / (2.0 * PI)
                     phases += turns - floor(turns)
+                    if (frame < 28 ||
+                        !result.coreObservationAccepted ||
+                        abs(result.corePhaseResidualSamples) >
+                        result.periodSamples * 0.10f
+                    ) {
+                        phaseDiagnostics +=
+                            "frame=$frame state=${result.phaseIdentityState} " +
+                            "period=${result.periodSamples} " +
+                            "pred=${result.predictedAnchorIndex} " +
+                            "selected=${result.selectedCandidateAnchorIndex} " +
+                            "out=${result.anchorIndex} residual=${result.corePhaseResidualSamples}"
+                    }
                 }
             }
 
@@ -305,7 +396,8 @@ class SimpleTriggerEngineTest {
                 minOf(direct, 1.0 - direct)
             }
             assertTrue(
-                "frequency=$frequency maxPhaseJump=$maximumPhaseJump phases=$phases",
+                "frequency=$frequency maxPhaseJump=$maximumPhaseJump phases=$phases " +
+                    "diagnostics=$phaseDiagnostics",
                 maximumPhaseJump <= 0.02,
             )
         }
@@ -557,9 +649,13 @@ class SimpleTriggerEngineTest {
     fun lowFrequencySweepReleasesStalePhasePrediction() {
         val engine = SimpleTriggerEngine()
         val samplesPerFrame = (sampleRate / 60f).roundToInt()
-        val phaseErrors = ArrayList<Double>()
+        val visiblePhaseErrors = ArrayList<Double>()
+        val corePhaseErrors = ArrayList<Double>()
         val estimatedFrequencies = ArrayList<Float>()
         val adaptiveWeights = ArrayList<Float>()
+        val phaseDiagnostics = ArrayList<String>()
+        val visiblePhaseErrorDiagnostics = ArrayList<String>()
+        val displayCorrectionViolations = ArrayList<String>()
 
         repeat(64) { frame ->
             val globalBase = frame.toLong() * samplesPerFrame
@@ -569,18 +665,78 @@ class SimpleTriggerEngineTest {
                 config(globalBase).copy(displayWindowSamples = 2_400),
             )
             assertTrue("frame=$frame did not lock", result.locked)
+            if (frame < 28 ||
+                !result.coreObservationAccepted ||
+                abs(result.corePhaseResidualSamples) >
+                result.periodSamples * 0.10f
+            ) {
+                phaseDiagnostics +=
+                    "frame=$frame state=${result.phaseIdentityState} " +
+                    "period=${result.periodSamples} " +
+                    "pred=${result.predictedAnchorIndex} " +
+                    "selected=${result.selectedCandidateAnchorIndex} " +
+                    "out=${result.anchorIndex} residual=${result.corePhaseResidualSamples} " +
+                    "display=${result.displayAlignmentApplied}/" +
+                    "${"%.3f".format(result.displayCenterScore)}/" +
+                    "${"%.3f".format(result.displayBestScore)}/" +
+                    "${"%.3f".format(result.displayPeakScoreGap)} " +
+                    "score=${"%.3f".format(result.confidence)} " +
+                    "assist=${"%.3f".format(result.assistScore)} " +
+                    "gap=${"%.3f".format(result.candidateScoreGap)} " +
+                    "candidates=${result.assistCandidateCount}/${result.scoredCandidateCount}"
+            }
             if (frame >= 8) {
                 val globalAnchor = globalBase + result.anchorIndex
-                phaseErrors += risingPhaseErrorRatio(sweptFundamentalPhase(globalAnchor))
+                val visiblePhaseError =
+                    risingPhaseErrorRatio(sweptFundamentalPhase(globalAnchor))
+                val coreGlobalAnchor = globalBase + result.coreAnchorIndex
+                val corePhaseError =
+                    risingPhaseErrorRatio(sweptFundamentalPhase(coreGlobalAnchor))
+                visiblePhaseErrors += visiblePhaseError
+                corePhaseErrors += corePhaseError
+
+                // The low-frequency display bridge is presentation-only and may move within
+                // 2.5% of the estimated period. Its output is therefore not the core phase
+                // estimator; verify both contracts independently.
+                val displayCorrection = abs(result.anchorIndex - result.coreAnchorIndex)
+                val allowedDisplayCorrection =
+                    maxOf(4, (result.periodSamples * 0.025f).roundToInt()) + 1
+                if (displayCorrection > allowedDisplayCorrection) {
+                    displayCorrectionViolations +=
+                        "frame=$frame correction=$displayCorrection " +
+                        "allowed=$allowedDisplayCorrection period=${result.periodSamples}"
+                }
+                if (visiblePhaseError > 0.03 || corePhaseError > 0.03) {
+                    visiblePhaseErrorDiagnostics +=
+                        "frame=$frame visible=${"%.4f".format(visiblePhaseError)} " +
+                        "core=${"%.4f".format(corePhaseError)} " +
+                        "coreAnchor=${result.coreAnchorIndex} out=${result.anchorIndex} " +
+                        "period=${result.periodSamples} pred=${result.predictedAnchorIndex} " +
+                        "display=${result.displayAlignmentApplied}/" +
+                        "${"%.3f".format(result.displayCenterScore)}/" +
+                        "${"%.3f".format(result.displayBestScore)}"
+                }
                 estimatedFrequencies += result.freqHz
                 adaptiveWeights += result.corrScopeWeight
             }
         }
 
-        val maxPhaseError = phaseErrors.maxOrNull() ?: 1.0
+        val maxCorePhaseError = corePhaseErrors.maxOrNull() ?: 1.0
         assertTrue(
-            "max phase error=$maxPhaseError, errors=$phaseErrors, frequencies=$estimatedFrequencies",
-            maxPhaseError <= 0.03,
+            "max core phase error=$maxCorePhaseError, errors=$corePhaseErrors, " +
+                "frequencies=$estimatedFrequencies diagnostics=$phaseDiagnostics " +
+                "visibleErrors=$visiblePhaseErrorDiagnostics",
+            maxCorePhaseError <= 0.03,
+        )
+        assertTrue(
+            "display correction violations=$displayCorrectionViolations",
+            displayCorrectionViolations.isEmpty(),
+        )
+        val maxVisiblePhaseError = visiblePhaseErrors.maxOrNull() ?: 1.0
+        assertTrue(
+            "max visible phase error=$maxVisiblePhaseError, errors=$visiblePhaseErrors, " +
+                "diagnostics=$visiblePhaseErrorDiagnostics",
+            maxVisiblePhaseError <= 0.07,
         )
         val maximumWeightStep = adaptiveWeights.zipWithNext { previous, current ->
             abs(current - previous)
